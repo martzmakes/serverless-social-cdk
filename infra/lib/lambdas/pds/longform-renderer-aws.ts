@@ -22,6 +22,7 @@ import * as lex from './lexicons'
 import { resolveTenant, apexTenant, type TenantStore } from './tenant'
 import { APEX_DID } from './tenant-keys'
 import { renderTargetForTenant, type RenderTarget } from './longform-tenant'
+import { prepareCoverPreview } from './cover-preview'
 
 const COLL = ((lex as any).LONGFORM_COLLECTION as string) || 'social.serverless.longform'
 
@@ -219,6 +220,9 @@ export function makeAwsPorts(): Ports {
   const repoDid = (sc?: TenantScope) => (isApexScope(sc) ? did : sc!.did)
 
   return {
+    prepareCover(cover, siteOrigin, scope) {
+      return prepareCoverPreview({ s3, bucket, cover, siteOrigin, pdsOrigin: origin, did: repoDid(scope) })
+    },
     async getProfile(scope) {
       const repo = repoDid(scope)
       const u = `${origin}/xrpc/com.atproto.repo.getRecord?repo=${encodeURIComponent(repo)}&collection=app.bsky.actor.profile&rkey=self`

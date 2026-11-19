@@ -11,6 +11,7 @@ import css from 'highlight.js/lib/languages/css'
 import sql from 'highlight.js/lib/languages/sql'
 import { sanitizeWithProfile, attr, type SanitizeProfile } from '../ap/sanitize'
 import { canonicalApHost } from '../ap/host'
+import { absoluteImageUrl, shareImageTags, type CoverPreview } from './longform-preview'
 
 export interface LongformContent {
   title: string
@@ -20,14 +21,9 @@ export interface LongformContent {
   excerpt?: string
   tags?: string[]
   originalUrl?: string
-  /**
-   * Defect C: optional fully-resolved cover image URL (e.g. the served
-   * `…/xrpc/com.atproto.sync.getBlob?did=…&cid=…` blob URL produced by the
-   * vault backfill). When present AND SAFE_URL-passing, it becomes the
-   * `og:image` / `twitter:image`; otherwise the existing `${origin}/og-default.png`
-   * default is kept (apex byte-lock: no cover → byte-identical output).
-   */
+  /** Published cover image URL and optional author-provided description. */
   coverImage?: string
+  coverImageAlt?: string
   /**
    * Spec #5d Task 10: when the longform was syndicated to Bluesky as a short
    * post, the renderer emits an inline comments widget (read-only) that
@@ -65,6 +61,7 @@ export interface RenderCtx {
   profile?: AuthorProfile
   /** Task 15: up to 3 related posts (see `pickRelated`). Omitted/empty → no section. */
   related?: RelatedPost[]
+  coverPreview?: CoverPreview
   /** Task 15: AP_CUSTOM_HOSTS allowlist, used for the Mastodon handle
    *  (`@user@canonicalApHost`). Omitted → every tenant is apex-hosted. */
   apCustomHosts?: string[]
@@ -942,19 +939,25 @@ ${name !== handle ? `<p class="author-handle">@${htmlEscape(handle)}</p>\n` : ''
   return `${card}${related}`
 }
 
+/** Prefer the cover description, then the alt text of that same image in the article. */
+export function coverAltText(value: unknown, markdown: string, cover: string, origin: string): string {
+  let alt = typeof value === 'string' ? value.trim() : ''
+  if (!alt) {
+    md.walkTokens(md.lexer(markdown), token => {
+      if (!alt && token.type === 'image' && absoluteImageUrl(token.href, origin) === cover) alt = token.text
+    })
+  }
+  return alt
+}
+
 export function renderArticleHtml(rec: LongformContent, ctx: RenderCtx): string {
   const url = `${ctx.origin}/${rec.slug}`
-  // Defect C: prefer the post's cover image (vault blob URL) for social cards;
-  // fall back to the site default. SAFE_URL-gated so a hostile cover value can
-  // never inject an attribute breakout / non-http scheme into og:image.
-  const img =
-    rec.coverImage && SAFE_URL.test(rec.coverImage)
-      ? rec.coverImage
-      : `${ctx.origin}/og-default.png`
-  // validation-2026-09-02: strip a duplicated in-body frontmatter block
-  // (see stripFrontmatter above) before it can leak into the rendered body,
-  // the read-time estimate, or the derived excerpt/description fallback.
+  const cover = absoluteImageUrl(rec.coverImage, ctx.origin)
+  const preview = cover ? ctx.coverPreview : undefined
   const strippedContent = stripFrontmatter(rec.content, rec.title)
+  const alt = cover ? coverAltText(rec.coverImageAlt, strippedContent, cover, ctx.origin) : undefined
+  const img = preview?.url ?? cover ?? `${ctx.origin}/og-default.png`
+  const imageTags = shareImageTags({ url: img, preview, alt: cover ? alt : undefined, isCover: !!cover })
   const desc = (rec.excerpt && rec.excerpt.trim()) || derived(strippedContent, 160)
   const title = `${rec.title} — ${ctx.siteName}`
   const siteName = htmlEscape(ctx.siteName)
@@ -962,7 +965,6 @@ export function renderArticleHtml(rec: LongformContent, ctx: RenderCtx): string 
   // siteName. JSON-LD keeps the raw `url` (it has its own jsonLdSafe encoder).
   const safeOrigin = htmlEscape(ctx.origin)
   const safeUrl = htmlEscape(url)
-  const safeImg = htmlEscape(img)
   const profileHref = `${safeOrigin}/profile/${encodeURIComponent(ctx.author)}`
   const metaRowHtml = buildMetaRow(rec, strippedContent, ctx.origin)
   const endMatter = renderEndMatter(rec, ctx)
@@ -976,6 +978,7 @@ export function renderArticleHtml(rec: LongformContent, ctx: RenderCtx): string 
     publisher: { '@type': 'Organization', name: ctx.siteName },
     mainEntityOfPage: url,
     description: desc,
+    ...(cover ? { image: img } : {}),
     keywords: realTags(rec).join(', '),
   })
   // Spec #5d Task 10: comments widget. Returns '' when not syndicated → apex
@@ -995,12 +998,12 @@ export function renderArticleHtml(rec: LongformContent, ctx: RenderCtx): string 
 <meta property="og:title" content="${htmlEscape(rec.title)}">
 <meta property="og:description" content="${htmlEscape(desc)}">
 <meta property="og:url" content="${safeUrl}">
-<meta property="og:image" content="${safeImg}">
+${imageTags.openGraph}
 <meta property="article:published_time" content="${htmlEscape(rec.createdAt)}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="${htmlEscape(rec.title)}">
 <meta name="twitter:description" content="${htmlEscape(desc)}">
-<meta name="twitter:image" content="${safeImg}">
+${imageTags.twitter}
 <link rel="alternate" type="application/rss+xml" href="${safeOrigin}/rss.xml">
 <link rel="icon" href="${safeOrigin}/favicon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">

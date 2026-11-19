@@ -113,6 +113,12 @@ The editor supports short posts and longform articles, autosave, image uploads, 
 
 Scheduling uses one-time EventBridge Scheduler jobs and an SQS-triggered publisher. Scheduled times are stored in UTC. Scheduler delivers within the selected minute and publication follows queue processing. Canceled or replaced jobs are ignored when delivered. The draft table and media bucket are retained after stack deletion. Monitor the editor dead-letter queue for exhausted deliveries.
 
+## Article link previews
+
+Set `coverImage` on a published longform record to use that image in its Open Graph and X card. For PNG and JPEG covers stored as platform blobs, the renderer writes a 1200 × 630 JPEG to the site bucket and serves it from CloudFront. The article retains the original image. Set `coverImageAlt` to describe the cover or give the matching image in the Markdown body alt text. External cover URLs are included directly in the metadata.
+
+To update generated pages for existing posts, build and run `infra/scripts/refresh-cover-previews.ts` with the tenant's site origin, PDS origin, DID, site bucket, and longform index table. Pass the tenant's S3 prefix for a secondary site. The default run lists affected pages. With `--apply` and a new `--backup-dir`, it backs up the original HTML and updates only its social tags. Invalidate the updated article paths in CloudFront after applying.
+
 ## Package verification
 
 Run `npm run test:package` in this directory. It packs the library, installs the tarball in a fresh app, and synthesizes all three configurations using offline fixtures.

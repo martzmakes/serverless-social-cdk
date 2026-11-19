@@ -6,6 +6,7 @@ import { buildBlueskySyndication } from './longform-syndication'
 import { safeSlug } from './longform-routing'
 import { APEX_DID } from './tenant-keys'
 import { parseCustomHosts } from '../ap/host'
+import type { CoverPreview } from './longform-preview'
 
 /** Per-event tenant identity threaded into every tenant-sensitive Ports call.
  *  - apex (isApex:true, did:APEX_DID, s3Prefix:''): the Ports adapter MUST use
@@ -21,8 +22,8 @@ export interface TenantScope { did: string; isApex: boolean; s3Prefix: string }
 const DEFAULT_APEX_SCOPE: TenantScope = { did: APEX_DID, isApex: true, s3Prefix: '' }
 
 export interface Ports {
-  /** Task 15 (optional): the tenant's app.bsky.actor.profile/self for the post's
-   *  author card. A failure or absence just renders the card without it. */
+  prepareCover?(cover: string, siteOrigin: string, scope?: TenantScope): Promise<CoverPreview | undefined>
+  /** The tenant's profile for the article's author card. */
   getProfile?(scope?: TenantScope): Promise<AuthorProfile | undefined>
   getRecord(rkey: string, scope?: TenantScope): Promise<(LongformContent & { syndicationTeaser?: string; syndicate?: boolean }) | undefined>
   putObject(key: string, body: string, contentType: string): Promise<void>
@@ -102,6 +103,12 @@ export async function processEvent(ev: RenderEvent, p: Ports, ctx: RenderCtx, s3
   try { profile = p.getProfile ? await p.getProfile(sc) : undefined } catch (e) {
     console.error('[longform] getProfile failed (non-fatal)', e)
   }
+  let coverPreview: CoverPreview | undefined
+  if (rec.coverImage && p.prepareCover) {
+    try { coverPreview = await p.prepareCover(rec.coverImage, ctx.origin, sc) } catch (error) {
+      console.warn('[longform] cover preview unavailable', (error as Error).name)
+    }
+  }
   const related = pickRelated(indexBefore, { rkey: ev.rkey, slug: next.currentSlug, tags: rec.tags })
 
   await p.putObject(`${s3Prefix}${next.currentSlug}/index.html`,
@@ -110,7 +117,7 @@ export async function processEvent(ev: RenderEvent, p: Ports, ctx: RenderCtx, s3
       slug: next.currentSlug,
       syndication: next.syndication,
       authorHandle: ctx.author,
-    }, { ...ctx, profile, related }), 'text/html; charset=utf-8')
+    }, { ...ctx, profile, related, coverPreview }), 'text/html; charset=utf-8')
 
   if (prev && prev.currentSlug && prev.currentSlug !== next.currentSlug) {
     await p.kvsPut(prev.currentSlug, `301 /${next.currentSlug}`, sc)
@@ -148,7 +155,7 @@ export async function processEvent(ev: RenderEvent, p: Ports, ctx: RenderCtx, s3
           slug: next.currentSlug,
           syndication: next.syndication,
           authorHandle: ctx.author,
-        }, { ...ctx, profile, related }), 'text/html; charset=utf-8')
+        }, { ...ctx, profile, related, coverPreview }), 'text/html; charset=utf-8')
     } catch (e) {
       console.error('[longform] syndication failed (non-fatal)', e)
     }
