@@ -1,7 +1,7 @@
 import type { APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2 } from "aws-lambda";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DeleteCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
-import { DeleteObjectCommand, DeleteObjectsCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { CopyObjectCommand, DeleteObjectCommand, DeleteObjectsCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { CreateScheduleCommand, DeleteScheduleCommand, SchedulerClient } from "@aws-sdk/client-scheduler";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { verifyJwt } from "../auth/lib/jwt";
@@ -133,6 +133,37 @@ function readJson(event: APIGatewayProxyEventV2): unknown {
   catch { throw new HttpError(400, "Invalid JSON."); }
 }
 
+async function copyDraft(draft: Draft, targetDid: string, requestId: string): Promise<Draft> {
+  const hash = createHash("sha256").update(JSON.stringify([draft.did, draft.id, draft.version, targetDid, requestId])).digest("hex");
+  const id = [hash.slice(0, 8), hash.slice(8, 12), hash.slice(12, 16), hash.slice(16, 20), hash.slice(20, 32)].join("-");
+  const existing = await getDraft(targetDid, id);
+  if (existing) return existing;
+
+  const media = Object.fromEntries(draft.fields.images.map(({ id }) => [id, draft.media[id]]));
+  const copy: Draft = {
+    id, did: targetDid, kind: draft.kind, version: 0, state: "draft", updatedAt: "", media,
+    fields: { ...draft.fields, slug: "" },
+  };
+  const uploads = await Promise.allSettled(copy.fields.images.map(({ id }) =>
+    s3.send(new CopyObjectCommand({
+      Bucket: bucket,
+      Key: mediaKey(copy, id),
+      CopySource: `${bucket}/${mediaKey(draft, id)}`,
+    })),
+  ));
+  const failed = uploads.find(result => result.status === "rejected");
+  if (failed?.status === "rejected") throw failed.reason;
+  try {
+    return await saveDraft(copy, undefined);
+  } catch (error) {
+    if ((error as Error).name === "ConditionalCheckFailedException") {
+      const saved = await getDraft(targetDid, id);
+      if (saved) return saved;
+    }
+    throw error;
+  }
+}
+
 function validKind(value: unknown): PostKind {
   if (value === "post" || value === "longform") return value;
   throw new HttpError(400, "Choose a post or an article.");
@@ -213,10 +244,20 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     if (method === "GET" && !action) return json(200, await view(draft, event));
 
     const data = action === "media" || method === "DELETE" ? undefined : readJson(event) as {
-      version?: unknown; fields?: unknown; enabled?: boolean; at?: unknown;
+      version?: unknown; fields?: unknown; enabled?: boolean; at?: unknown; targetDid?: unknown; requestId?: unknown;
     } | null;
     const expected = action === "media" || method === "DELETE" ? Number(query.version) : data?.version;
     if (expected !== draft.version) throw new HttpError(409, "This draft changed. Reload before editing it again.");
+    if (action === "copy" && method === "POST") {
+      requireEditable(draft);
+      const { targetDid, requestId } = data ?? {};
+      if (typeof targetDid !== "string" || targetDid === did || targetDid.length > 512 || !targetDid.startsWith("did:")
+          || typeof requestId !== "string" || !uuidPattern.test(requestId)) {
+        throw new HttpError(400, "Choose a different publishing identity.");
+      }
+      await authorize(email, targetDid);
+      return json(201, await view(await copyDraft(draft, targetDid, requestId), event));
+    }
     let next: Draft;
 
     if (!action && method === "DELETE") {

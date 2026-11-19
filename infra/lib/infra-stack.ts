@@ -1423,6 +1423,42 @@ export class InfraStack extends cdk.Stack {
 
     const postAnalytics = new PostAnalyticsTable(this, "PostAnalyticsTable");
 
+    const postInsights = new lambda.NodejsFunction(this, "PostInsights", {
+      ...lambdaDefaults,
+      environment: {
+        DOMAIN,
+        PROJECT_SLUG,
+        JWT_SECRET_NAME,
+        PDS_HANDLE: pdsHandle,
+        ALLOWED_EMAILS: allowedEmails,
+        KNOWN_TENANT_HOSTS,
+        TENANTS_TABLE: tenantsTable.table.tableName,
+        LONGFORM_INDEX_TABLE: longformIndex.table.tableName,
+        POST_ANALYTICS_TABLE: postAnalytics.table.tableName,
+        SITE_BUCKET: siteBucket.bucketName,
+        AP_CUSTOM_HOSTS: KNOWN_TENANT_HOSTS,
+        AP_INBOUND_TABLE: apInboundPostsTable.tableName,
+      },
+      ...lambdaSource("analytics/insights"),
+    });
+    jwtSecretParam.grantRead(postInsights);
+    tenantsTable.table.grantReadData(postInsights);
+    longformIndex.table.grantReadData(postInsights);
+    postAnalytics.table.grantReadData(postInsights);
+    siteBucket.grantRead(postInsights, "*/index.html");
+    postInsights.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:Query"],
+      resources: [`${apInboundPostsTable.tableArn}/index/byPublished`],
+    }));
+
+    const insightsIntegration = new apigwv2Integrations.HttpLambdaIntegration("PostInsightsIntegration", postInsights);
+    for (const path of [
+      "/auth/insights", "/auth/insights/articles", "/auth/insights/articles/{rkey}", "/auth/insights/articles/{rkey}/distribution",
+      "/auth/insights/articles/{rkey}/replies",
+    ]) {
+      authHttpApi.addRoutes({ path, methods: [apigwv2.HttpMethod.GET], integration: insightsIntegration });
+    }
+
     const analyticsAggregate = new lambda.NodejsFunction(
       this,
       "AnalyticsAggregate",

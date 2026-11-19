@@ -214,14 +214,14 @@ export async function signRequest(
   // request-target path = origin-form (path + optional query), used verbatim.
   const path = u.pathname + (u.search || '')
 
-  const digest = sha256DigestHeader(body)
+  const hasBody = method !== 'GET' && method !== 'HEAD'
   const date = new Date().toUTCString() // RFC-1123 GMT, e.g. "Mon, 18 May 2026 14:30:00 GMT"
 
-  const headerList = ['(request-target)', 'host', 'date', 'digest']
-  const signingHeaders: Record<string, string> = {
-    host,
-    date,
-    digest,
+  const headerList = ['(request-target)', 'host', 'date']
+  const signingHeaders: Record<string, string> = { host, date }
+  if (hasBody) {
+    headerList.push('digest')
+    signingHeaders.digest = sha256DigestHeader(body)
   }
   const signingString = buildSigningString(
     headerList,
@@ -236,13 +236,12 @@ export async function signRequest(
     })
     .toString('base64')
 
-  const signature = `keyId="${keyId}",algorithm="rsa-sha256",headers="(request-target) host date digest",signature="${b64}"`
+  const signature = `keyId="${keyId}",algorithm="rsa-sha256",headers="${headerList.join(' ')}",signature="${b64}"`
 
   return {
     Host: host,
     Date: date,
-    Digest: digest,
-    'Content-Type': 'application/activity+json',
+    ...(hasBody ? { Digest: signingHeaders.digest, 'Content-Type': 'application/activity+json' } : {}),
     Signature: signature,
   }
 }

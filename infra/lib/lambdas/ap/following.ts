@@ -96,6 +96,7 @@ export async function resolveActorByAcct(
   acct: { user: string; domain: string },
   fetchJson: FetchJson,
   ownHosts: string[],
+  fetchActor: FetchJson = fetchJson,
 ): Promise<ResolvedActor> {
   const fail = (m: string): never => {
     throw new FollowResolveError(m)
@@ -119,7 +120,7 @@ export async function resolveActorByAcct(
 
   let doc: any
   try {
-    doc = await fetchJson(href)
+    doc = await fetchActor(href)
   } catch (e: any) {
     return fail(`actor fetch failed: ${e?.message ?? 'error'}`)
   }

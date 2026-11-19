@@ -20,7 +20,10 @@ vi.mock("../lib/lambdas/auth/lib/jwt", () => ({
   verifyJwt: async (token: string) => ({ email: token }),
 }));
 vi.mock("../lib/lambdas/auth/entitlements", () => ({
-  resolveApprovedDids: async (email: string) => [{ did: `did:web:${email}`, handle: email }],
+  resolveApprovedDids: async (email: string) => [
+    { did: `did:web:${email}`, handle: email },
+    ...(email === "writer.example.com" ? [{ did: "did:web:second.example.com", handle: "second.example.com" }] : []),
+  ],
 }));
 vi.mock("../lib/lambdas/auth/session-mint", () => ({
   mintFirstPartySessionFor: async (email: string, did: string) =>
@@ -71,6 +74,12 @@ vi.mock("@aws-sdk/client-s3", async importOriginal => {
       async send(command: any) {
         if (command instanceof sdk.PutObjectCommand) {
           fixture.media.set(command.input.Key!, Buffer.from(command.input.Body as Buffer));
+          return {};
+        }
+        if (command instanceof sdk.CopyObjectCommand) {
+          const source = fixture.media.get(command.input.CopySource!.slice("draft-media/".length));
+          if (!source) throw Error("Unknown source image");
+          fixture.media.set(command.input.Key!, Buffer.from(source));
           return {};
         }
         const media = fixture.media.get(command.input.Key);
@@ -145,7 +154,9 @@ describe("editor authorization and publication", () => {
   it("stores images privately and revokes both shared HTML and media despite an out-of-date index", async () => {
     const draft = await create("longform");
     const identities = await request("GET", "/identities");
-    expect(JSON.parse(identities.body)).toEqual({ identities: [{ did, handle: "writer.example.com" }] });
+    expect(JSON.parse(identities.body)).toEqual({ identities: [
+      { did, handle: "writer.example.com" }, { did: "did:web:second.example.com", handle: "second.example.com" },
+    ] });
     expect((await request("GET", `/${draft.id}`, undefined, null)).status).toBe(401);
     expect((await request("GET", `/${draft.id}`, undefined, "other.example.com")).status).toBe(403);
     expect((await request("GET", `/${draft.id}`, undefined, "other.example.com", "did:web:other.example.com")).status).toBe(404);
@@ -251,4 +262,31 @@ describe("editor authorization and publication", () => {
     expect(done.state).toBe("published");
     expect(done.result.uri).toBe(publicRecord.uri);
   });
+});
+
+it("copies photos to an approved identity as an independent, idempotent private draft", async () => {
+  const created = JSON.parse((await request("POST", "", { kind: "longform" })).body) as EditorDraft;
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const withImage = JSON.parse((await request("POST", `/${created.id}/media?version=${created.version}`, png)).body) as EditorDraft;
+  const saved = JSON.parse((await request("PUT", `/${created.id}`, {
+    version: withImage.version, fields: { ...withImage.fields, title: "Copy", slug: "existing-slug", content: "body" },
+  })).body) as EditorDraft;
+  const shared = JSON.parse((await request("POST", `/${created.id}/share`, { version: saved.version, enabled: true })).body) as EditorDraft;
+  const input = {
+    version: shared.version,
+    targetDid: "did:web:second.example.com",
+    requestId: "d79baf35-8709-4c9c-92f9-85b561438fdc",
+  };
+  const action = `/${created.id}/copy`;
+  expect((await request("POST", action, { ...input, targetDid: "did:web:other.example.com" })).status).toBe(403);
+  const response = await request("POST", action, input);
+  expect(response.status).toBe(201);
+  const copy = JSON.parse(response.body) as EditorDraft;
+  expect(copy).toMatchObject({ did: input.targetDid, state: "draft", fields: { title: "Copy", slug: "", images: shared.fields.images } });
+  expect(copy.id).not.toBe(created.id);
+  expect(copy.shareUrl).toBeUndefined();
+  expect(copy.scheduledAt).toBeUndefined();
+  expect(fixture.media.get(`${copy.id}/${copy.fields.images[0].id}`)).toEqual(png);
+  expect(JSON.parse((await request("POST", action, input)).body).id).toBe(copy.id);
+  expect((await request("GET", `/${copy.id}`)).status).toBe(404);
 });

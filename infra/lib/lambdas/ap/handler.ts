@@ -85,6 +85,7 @@ import {
   MAX_TIMELINE_LIMIT,
   buildTimeline,
   ingestActivity,
+  ingestArticleReply,
   type ApInboundStore,
 } from './ingest'
 
@@ -160,7 +161,7 @@ export interface ApDeps {
   verifyRequest: typeof verifyRequest
   signRequest: typeof signRequest
   /** Hardened https-only fetch+validate of the signing actor doc by keyId. */
-  fetchRemoteActor(keyId: string): Promise<RemoteActor>
+  fetchRemoteActor(keyId: string, from: { handle: string; origin: string }): Promise<RemoteActor>
   /** POST a pre-signed activity body to a remote inbox. */
   deliverActivity(
     inboxUrl: string,
@@ -223,6 +224,8 @@ export interface ApDeps {
    * documents and Announce targets.
    */
   fetchJson?: FetchJson
+  /** Fetch the account's actor document, with signed discovery if required. */
+  fetchActorJson?(url: string, from: { handle: string; origin: string }): Promise<unknown>
   /**
    * Resolves an Authorization header to the DID of a first-party plain-Bearer
    * session (the token /auth/pds-session mints), or null. DPoP-bound tokens
@@ -375,10 +378,11 @@ function hostOf(u: string): string | null {
  * force EXACTLY ONE refetch and re-verify. Still false → 401.
  */
 async function handleInbox(
-  handle: string,
+  tenant: Tenant,
   req: ApRequest,
   deps: ApDeps,
 ): Promise<ApResult> {
+  const { handle, did } = tenant;
   if (req.rawBody.length > INBOX_MAX_BODY_BYTES) {
     console.warn(
       JSON.stringify({ at: 'ap.inbox', event: 'body_too_large', handle, bytes: req.rawBody.length }),
@@ -492,7 +496,7 @@ async function handleInbox(
     actorInbox = cached.inbox
     usedCache = true
   } else {
-    const fetched = await fetchAndBind(keyId, keyIdHost, deps)
+    const fetched = await fetchAndBind(keyId, keyIdHost, { handle, origin }, deps)
     if ('error' in fetched) return fetched.error
     actorId = fetched.actor.id
     actorInbox = fetched.actor.inbox
@@ -509,7 +513,7 @@ async function handleInbox(
 
   // Key rotation: cached key failed → ONE forced refetch + re-verify.
   if (!ok && usedCache) {
-    const fetched = await fetchAndBind(keyId, keyIdHost, deps)
+    const fetched = await fetchAndBind(keyId, keyIdHost, { handle, origin }, deps)
     if ('error' in fetched) return fetched.error
     actorId = fetched.actor.id
     actorInbox = fetched.actor.inbox
@@ -643,6 +647,10 @@ async function handleInbox(
       return err(401, 'Unauthorized', 'Activity actor does not match signer')
     }
     const followee = await deps.following.get(handle, actorId)
+    const reply = deps.getArticle && await ingestArticleReply(type, activity, {
+      handle, origin, signerId: actorId, followee, store: deps.inbound,
+      hasArticle: async rkey => !!await deps.getArticle!(did, rkey),
+    });
     const outcome = await ingestActivity(type, activity, {
       handle,
       signerId: actorId,
@@ -650,7 +658,7 @@ async function handleInbox(
       store: deps.inbound,
       fetchJson: deps.fetchJson,
     })
-    return json(202, { status: outcome === 'ignored' ? 'ignored' : 'accepted' })
+    return json(202, { status: outcome === 'ignored' && (!reply || reply === 'ignored') ? 'ignored' : 'accepted' })
   }
   if (type === 'Block' && objectId(activity?.object) === ourActorId) {
     await deps.followers.remove(handle, actorId)
@@ -674,11 +682,12 @@ function keyIdHostActorId(keyId: string): string {
 async function fetchAndBind(
   keyId: string,
   keyIdHost: string,
+  from: { handle: string; origin: string },
   deps: ApDeps,
 ): Promise<{ actor: RemoteActor } | { error: ApResult }> {
   let actor: RemoteActor
   try {
-    actor = await deps.fetchRemoteActor(keyId)
+    actor = await deps.fetchRemoteActor(keyId, from)
   } catch (e: any) {
     console.warn(
       JSON.stringify({
@@ -899,7 +908,11 @@ async function handleOwnerRoute(
     const ownHosts = [APEX_DOMAIN, ...customHosts]
     let target
     try {
-      target = await resolveActorByAcct(acct, deps.fetchJson, ownHosts)
+      const fetchActor = deps.fetchActorJson
+      target = await resolveActorByAcct(
+        acct, deps.fetchJson, ownHosts,
+        fetchActor ? url => fetchActor(url, { handle: t.handle, origin }) : undefined,
+      )
     } catch (e: any) {
       if (!(e instanceof FollowResolveError)) {
         console.warn(JSON.stringify({ at: 'ap.follow', event: 'resolve_error', message: e?.message }))
@@ -1034,7 +1047,7 @@ export async function dispatch(
         if (!tenant) return err(404, 'NotFound', 'No such actor')
         // `await` so a throw is caught below (clean 500) instead of escaping as
         // a rejected promise out of the try.
-        return await handleInbox(tenant.handle, req, deps)
+        return await handleInbox(tenant, req, deps)
       }
 
       // All remaining routes are GET only.

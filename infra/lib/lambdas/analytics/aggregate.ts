@@ -43,8 +43,8 @@
 //        approximate human reads; §8 DoD: per-slug/day bot-FILTERED counts.
 //        Crawler traffic is frequently the majority of hits — counting bots in
 //        `views` makes the headline metric misleading. Therefore:
-//          • uaClass === 'human' → main `ADD #v :one, #uh :one` (views +
-//            uaHuman) AND the per-referrer-host `ADD #c :one`. The full
+//          • uaClass === 'human' → main `ADD #v :one, #uh :one, #cv :one, #src :one, #device :one` (views,
+//            uaHuman, classification coverage, source, and device) AND the per-referrer-host `ADD #c :one`. The full
 //            human-read picture: views + uaHuman + a REF# row.
 //          • uaClass === 'bot'  → ONLY main `ADD #ub :one` (uaBot). NO `#v`
 //            (views) increment; NO `REF#` row (a bot's referrer is noise —
@@ -202,7 +202,7 @@ export async function aggregateLogObject(
     // overlapping-path ValidationException):
     //   HUMAN (uaClass !== 'bot'):
     //     (a) MAIN     Key {pk:'VIEW#'+slug, sk:utcDay}
-    //                 `ADD #v :one, #uh :one`   (views + uaHuman)
+    //                 `ADD #v :one, #uh :one, #cv :one, #src :one, #device :one`   (views and attribution)
     //     (b) REFERRER Key {pk:'VIEW#'+slug, sk:'REF#'+utcDay+'#'+host}
     //                 `ADD #c :one`             (this host's discrete count)
     //   BOT (uaClass === 'bot'):
@@ -236,15 +236,18 @@ export async function aggregateLogObject(
         continue
       }
       // HUMAN:
-      // (a) main rollup — views + uaHuman (pure top-level ADD).
+      // (a) main rollup — views, source, and device (pure top-level ADD).
       await doc.send(
         new UpdateCommand({
           TableName: table,
           Key: { pk, sk: utcDay },
-          UpdateExpression: 'ADD #v :one, #uh :one',
+          UpdateExpression: 'ADD #v :one, #uh :one, #cv :one, #src :one, #device :one',
           ExpressionAttributeNames: {
             '#v': 'views',
             '#uh': 'uaHuman',
+            '#cv': 'classifiedViews',
+            '#src': 'source_' + ev.source,
+            '#device': 'device_' + ev.device,
           },
           ExpressionAttributeValues: { ':one': 1 },
         }),

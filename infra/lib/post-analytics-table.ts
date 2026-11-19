@@ -5,9 +5,9 @@ import { Construct } from 'constructs'
 /**
  * Post analytics rollup (Spec #8 / Phase E).
  *
- * pk = VIEW#<slug>      / sk = <yyyy-mm-dd>            → per-slug/day rollup
- *                                                       (views/uaHuman/uaBot)
- * pk = VIEW#<slug>      / sk = REF#<yyyy-mm-dd>#<host> → per-host referrer
+ * pk = VIEW#<host>#<slug>      / sk = <yyyy-mm-dd>            → per-slug/day rollup
+ *                                                       (views, bot counts, attribution)
+ * pk = VIEW#<host>#<slug>      / sk = REF#<yyyy-mm-dd>#<host> → per-host referrer
  *                                                       count (human-only)
  * pk = CLAIM#<s3key>    / sk = LOG                     → at-least-once claim
  *                                                       latch (TTL-expired

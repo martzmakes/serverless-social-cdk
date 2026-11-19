@@ -9,6 +9,8 @@
   "include": [
     "index.ts",
     "editor.ts",
-    "editor-web.tsx"
+    "editor-web.tsx",
+    "insights.ts",
+    "insights-web.tsx"
   ]
 }

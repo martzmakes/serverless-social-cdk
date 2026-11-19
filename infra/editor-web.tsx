@@ -1,3 +1,4 @@
+export { PublishingCalendar } from "./publishing-calendar-web";
 import {
   useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode,
 } from "react";
@@ -10,6 +11,7 @@ export interface PostEditorProps {
   client: Client;
   identity: string;
   initialKind?: PostKind;
+  initialDraftId?: string;
   onDirtyChange?: (dirty: boolean) => void;
   onPublished?: (post: NonNullable<EditorDraft["result"]>, kind: PostKind) => void;
   renderMarkdown?: (source: string) => ReactNode;
@@ -36,7 +38,7 @@ const css = `
 `;
 
 /** Reusable authoring UI for a web app that already supplies an authenticated editor client. */
-export function PostEditor({ client, identity, initialKind = "post", onDirtyChange, onPublished, renderMarkdown, accent }: PostEditorProps) {
+export function PostEditor({ client, identity, initialKind = "post", initialDraftId, onDirtyChange, onPublished, renderMarkdown, accent }: PostEditorProps) {
   const [draft, setDraft] = useState<EditorDraft>();
   const [fields, setFields] = useState<DraftFields>();
   const [tagText, setTagText] = useState("");
@@ -68,6 +70,20 @@ export function PostEditor({ client, identity, initialKind = "post", onDirtyChan
     setCopied(false);
     setScheduleAt("");
   }, []);
+
+  useEffect(() => {
+    if (!initialDraftId) return;
+    let active = true;
+    setBusy(true);
+    setError(undefined);
+    void client.get(initialDraftId).then(next => {
+      if (!active) return;
+      setKind(next.kind);
+      open(next);
+    }).catch(reason => { if (active) showError(reason); })
+      .finally(() => { if (active) setBusy(false); });
+    return () => { active = false; };
+  }, [client, initialDraftId, open]);
 
   const refresh = useCallback(async (after?: string) => {
     if (tab === "drafts") {

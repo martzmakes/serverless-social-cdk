@@ -6,12 +6,14 @@
 // cs(User-Agent) are URL-encoded). Parsing is driven BY the `#Fields:` header
 // (name→index map) so AWS field-order drift does not break us.
 //
-// ZERO PII: this module never returns IPs, cookies, full URLs, query strings,
-// or any per-user value — only { slug, referrerHost (eTLD+1), uaClass }.
+// The rollup input excludes IPs, cookies, full URLs, query strings,
+// or any per-user value. Attribution is reduced to fixed source and device groups.
 //
-// No new dependency: only `node:url` + a READ-ONLY import of the reserved-path
-// logic that is the single source of truth shared with longform-edge.js.
+// Reserved-path filtering shares the rules used by longform-edge.js.
 
+import { isIP } from 'node:net'
+import type { Device, Source } from '../../../insights'
+import { classifyDevice, classifySource, decodeLogField } from './attribution'
 import { isReserved } from '../pds/longform-routing'
 
 export type ViewEvent = {
@@ -22,6 +24,8 @@ export type ViewEvent = {
   day: string | undefined
   referrerHost: string
   uaClass: 'human' | 'bot'
+  source: Source
+  device: Device
 }
 
 const HOST_RE = /^[a-z0-9.-]+$/
@@ -33,21 +37,27 @@ function normHost(raw: string | undefined): string | undefined {
   return h && HOST_RE.test(h) ? h : undefined
 }
 
-/**
- * eTLD+1 of a (URL-encoded) referrer. `-`/empty/undefined → 'direct'.
- * Unparseable → 'direct'. `www.` stripped; reduced to registrable domain.
- */
-export function referrerHost(raw: string | undefined): string {
-  if (raw === undefined || raw === '' || raw === '-') return 'direct'
-  let url: URL
+function referrerHostname(raw: string | undefined): string | undefined {
+  if (!raw || raw === '-') return undefined
   try {
-    const decoded = decodeURIComponent(raw)
-    url = new URL(decoded)
+    // Direct URL parsing preserves percent-encoded characters inside the URL.
+    // CloudFront can also encode the whole URL field.
+    const url = new URL(raw.includes('://') ? raw : decodeLogField(raw))
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined
+    const host = normHost(url.hostname.replace(/\.$/, ''))
+    return host && host.includes('.') && !isIP(host) ? host : undefined
   } catch {
-    return 'direct'
+    return undefined
   }
-  let host = url.hostname.toLowerCase()
-  if (host.startsWith('www.')) host = host.slice(4)
+}
+
+/** Reduce the logged referrer to an approximate registrable domain or "direct". */
+export function referrerHost(raw: string | undefined): string {
+  return referrerDomain(referrerHostname(raw))
+}
+
+function referrerDomain(host: string | undefined): string {
+  if (!host) return 'direct'
   const labels = host.split('.')
   if (labels.length <= 2) return host
   // Pragmatic, intentionally NON-EXHAUSTIVE set of 2-level public suffixes
@@ -152,12 +162,18 @@ export function parseCloudFrontLog(buf: Buffer): ViewEvent[] {
       if (isAssetOrReserved(slug)) continue
 
       const rawDay = get('date')
+      const host = normHost(get('x-host-header')) ?? normHost(get('cs(Host)')) ?? 'unknown'
+      const referrer = referrerHostname(get('cs(Referer)'))
+      const domain = referrerDomain(referrer)
+      const agent = get('cs(User-Agent)')
       out.push({
         slug,
-        host: normHost(get('x-host-header')) ?? normHost(get('cs(Host)')) ?? 'unknown',
+        host,
         day: rawDay && /^\d{4}-\d{2}-\d{2}$/.test(rawDay) ? rawDay : undefined,
-        referrerHost: referrerHost(get('cs(Referer)')),
-        uaClass: uaClass(get('cs(User-Agent)')),
+        referrerHost: domain,
+        uaClass: uaClass(agent),
+        source: classifySource(get('cs-uri-query'), domain, referrer === host),
+        device: classifyDevice(decodeLogField(agent ?? '')),
       })
     } catch {
       // Any per-row error (bad %-encoding, etc.) → skip; never throw out.

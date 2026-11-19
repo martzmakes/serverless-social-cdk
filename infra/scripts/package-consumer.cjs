@@ -79,6 +79,11 @@ assert.equal(resources("Editor", "AWS::EC2::Instance").length, 0);
 assert.equal(resources("Standalone", "AWS::Scheduler::ScheduleGroup").length, 0);
 assert.ok(require("@martzmakes/serverless-social/editor").createEditorClient);
 assert.ok(require.resolve("@martzmakes/serverless-social/editor-web"));
+assert.ok(require("@martzmakes/serverless-social/insights").createInsightsClient);
+assert.ok(require.resolve("@martzmakes/serverless-social/insights-web"));
+for (const route of ["/auth/insights", "/auth/insights/articles", "/auth/insights/articles/{rkey}", "/auth/insights/articles/{rkey}/distribution", "/auth/insights/articles/{rkey}/replies"]) {
+  assert.ok(resources("Standalone", "AWS::ApiGatewayV2::Route").some(item => item.RouteKey === `GET ${route}`));
+}
 const existingOrigin = originFor(distribution("ExistingFirehose"), stream);
 assert.equal(existingOrigin.DomainName, "firehose.example.com");
 assert.deepEqual(existingOrigin.OriginCustomHeaders, [

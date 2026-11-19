@@ -187,11 +187,58 @@ function log(event: string, fields: Record<string, unknown>) {
 }
 
 /** Common checks for a Create/Update object body. */
-function authoredNote(obj: any, c: IngestCtx): obj is Record<string, any> {
+function authoredNote(obj: any, c: Pick<IngestCtx, "signerId">): obj is Record<string, any> {
   if (!obj || typeof obj !== 'object') return false
   if (obj.type !== 'Note' && obj.type !== 'Article') return false
   if (!validObjectId(obj.id) || hostOf(obj.id) !== hostOf(c.signerId)) return false
   return singleId(obj.attributedTo) === c.signerId
+}
+
+export const articleRepliesPartition = (handle: string) => `${handle}#article-replies`;
+
+export async function ingestArticleReply(type: string, activity: any, c: {
+  handle: string
+  origin: string
+  signerId: string
+  followee: FollowingRow | null
+  store: ApInboundStore
+  hasArticle: (rkey: string) => Promise<boolean>
+  now?: () => number
+}): Promise<IngestOutcome> {
+  const partition = articleRepliesPartition(c.handle);
+  if (type === 'Delete') {
+    const id = singleId(activity?.object);
+    if (!validObjectId(id) || hostOf(id) !== hostOf(c.signerId)) return 'ignored';
+    return await c.store.remove(partition, noteKey(id), c.signerId) ? 'deleted' : 'ignored';
+  }
+  if (type !== 'Create' && type !== 'Update') return 'ignored';
+  const obj = activity?.object;
+  if (!authoredNote(obj, c)) return 'ignored';
+  const key = noteKey(obj.id);
+  // Article replies keep only public or unlisted content. A later visibility
+  // change or a deleted note must also disappear from the author's inbox.
+  const parent = singleId(obj.inReplyTo);
+  const prefix = `${c.origin}/ap/users/${c.handle}/articles/`;
+  const rkey = parent?.startsWith(prefix) ? parent.slice(prefix.length) : '';
+  const validParent = /^(?!\.{1,2}$)[a-zA-Z0-9._~:-]{1,512}$/.test(rkey);
+  if (!validParent || !isVisible(audience(obj, activity), undefined, false)) {
+    return type === 'Update' && await c.store.remove(partition, key, c.signerId) ? 'deleted' : 'ignored';
+  }
+  const now = (c.now ?? Date.now)();
+  const shaped = shapeObject(obj, now);
+  if (!shaped) return 'ignored';
+  if (type === 'Update') {
+    return await c.store.update(partition, key, c.signerId, {
+      content: shaped.content, attachments: shaped.attachments, url: shaped.url,
+    }) ? 'updated' : 'ignored';
+  }
+  if (!await c.hasArticle(rkey)) return 'ignored';
+  const actor = c.followee ? actorOf(c.followee) : { id: c.signerId, handle: hostOf(c.signerId)! };
+  const created = await c.store.putIfAbsent(partition, {
+    key, owner: c.signerId, sortKey: `${rkey}#${shaped.published}#${key.slice(0, 16)}`,
+    item: { id: obj.id, actor, ...shaped }, ttl: Math.floor(now / 1000) + INBOUND_TTL_SECONDS,
+  });
+  return created ? 'stored' : 'ignored';
 }
 
 export async function ingestCreate(activity: any, c: IngestCtx): Promise<IngestOutcome> {

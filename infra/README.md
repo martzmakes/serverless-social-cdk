@@ -113,6 +113,41 @@ The editor supports short posts and longform articles, autosave, image uploads, 
 
 Scheduling uses one-time EventBridge Scheduler jobs and an SQS-triggered publisher. Scheduled times are stored in UTC. Scheduler delivers within the selected minute and publication follows queue processing. Canceled or replaced jobs are ignored when delivered. The draft table and media bucket are retained after stack deletion. Monitor the editor dead-letter queue for exhausted deliveries.
 
+## Add the publishing calendar
+
+Pass your signed-in layout's origin and token provider to the calendar exported with the editor.
+
+```tsx
+import { PublishingCalendar } from "@martzmakes/serverless-social/editor-web";
+
+<PublishingCalendar origin={window.location.origin} token={getStoredAppJwt}
+  onOpen={(draft, did) => openDraftInYourEditor(did, draft.kind, draft.id)} />;
+```
+
+The calendar loads drafts and schedules for every approved publishing identity and displays schedules in the browser's local time. Opening a draft should pass its ID as `initialDraftId` to `PostEditor` with a client scoped to the selected DID. A cross-site copy creates a private unscheduled draft for another approved identity and copies its attached uploads. Choose a new URL slug, customize the copy, and schedule it separately in the destination editor.
+
+## Add the post control room
+
+The full `ServerlessSocialStack` includes article analytics for its primary and `secondarySite` CloudFront distributions. Both distributions deliver access logs to the existing private S3 bucket. A Lambda updates DynamoDB by viewer hostname, article slug, and UTC day. An authenticated read API serves reports only for publishing sites approved for the app session.
+
+Mount the React view inside your signed-in layout and give it the same application JWT used by the rest of the site. The site picker defaults to the current hostname when the author has access to it.
+
+```tsx
+import { createInsightsClient } from "@martzmakes/serverless-social/insights";
+import { PostInsights } from "@martzmakes/serverless-social/insights-web";
+
+const client = createInsightsClient({
+  origin: window.location.origin,
+  token: getStoredAppJwt,
+});
+
+<PostInsights client={client} preferredHost={window.location.hostname} />;
+```
+
+The report counts page requests classified as human, grouped by day. It estimates mobile, tablet, desktop, and unknown device groups from the user agent. An allowlisted `utm_source` tag takes priority over the observed referrer. Share tagged links when an app may omit referrers. Without either signal the source is Direct or unavailable. CloudFront delivers logs asynchronously, so recent totals can change after a delay.
+
+Existing per-site daily totals and referrer domains remain available. Source and device coverage starts when the updated aggregator processes logs. The rollup keeps counters and reduced referrer domains. Original access logs stay in the private bucket and expire after 30 days. The report uses the article's current canonical slug. It shows the latest saved Bluesky engagement snapshot when available, the Fediverse article object, and the Open Graph metadata from the published page. Open Article replies to read the Bluesky conversation alongside public and unlisted direct replies received over ActivityPub. Fediverse reply collection starts when the updated inbox handler is deployed and retains each reply for 90 days. Replies link back to their originating network.
+
 ## Article link previews
 
 Set `coverImage` on a published longform record to use that image in its Open Graph and X card. For PNG and JPEG covers stored as platform blobs, the renderer writes a 1200 × 630 JPEG to the site bucket and serves it from CloudFront. The article retains the original image. Set `coverImageAlt` to describe the cover or give the matching image in the Markdown body alt text. External cover URLs are included directly in the metadata.

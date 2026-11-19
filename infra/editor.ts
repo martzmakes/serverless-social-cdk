@@ -100,6 +100,8 @@ export function createEditorClient(options: {
     }>(`/published?kind=${kind}${after ? `&after=${encodeURIComponent(after)}` : ""}`),
     create: (kind: PostKind, rkey?: string) => request<EditorDraft>("", "POST", { kind, rkey }),
     get: (id: string) => request<EditorDraft>(item(id)),
+    copy: (id: string, version: number, targetDid: string, requestId: string) =>
+      request<EditorDraft>(`${item(id)}/copy`, "POST", { version, targetDid, requestId }),
     save: (id: string, version: number, fields: DraftFields) =>
       request<EditorDraft>(item(id), "PUT", { version, fields }),
     remove: (id: string, version: number) =>

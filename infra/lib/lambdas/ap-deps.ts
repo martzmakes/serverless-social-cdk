@@ -314,6 +314,7 @@ export async function assertSafeRemoteUrl(
   if (url.protocol !== 'https:') {
     throw new Error('refusing non-https url')
   }
+  if (url.username || url.password) throw new Error('refusing credentials in URL')
   // url.hostname strips the [] from an IPv6 literal already.
   // URL.hostname KEEPS the [] around an IPv6 literal — strip them so the
   // isIP / isBlockedIp checks see the bare address.
@@ -348,6 +349,22 @@ export async function assertSafeRemoteUrl(
   }
 }
 
+type SignRemoteGet = (url: string) => Promise<Record<string, string>>
+
+async function fetchRemoteJsonResponse(url: string, accept: string, signFetch?: SignRemoteGet): Promise<Response> {
+  const signal = AbortSignal.timeout(REMOTE_FETCH_TIMEOUT_MS)
+  const get = (headers: Record<string, string> = {}) => fetch(url, {
+    method: 'GET',
+    headers: { accept, ...headers },
+    redirect: 'manual',
+    signal,
+  })
+  const res = await get()
+  if (res.status !== 401 || !signFetch) return res
+  await res.body?.cancel()
+  return get(await signFetch(url))
+}
+
 /**
  * Hardened remote-actor fetch. ATTACKER-FACING:
  *  - SSRF guard (https-only + IMDS/RFC1918/loopback/link-local/CGNAT block)
@@ -359,6 +376,7 @@ export async function assertSafeRemoteUrl(
 export async function realFetchRemoteActor(
   keyId: string,
   lookupAll: DnsLookupAll = defaultDnsLookupAll,
+  signFetch?: SignRemoteGet,
 ): Promise<RemoteActor> {
   let url: URL
   try {
@@ -366,17 +384,14 @@ export async function realFetchRemoteActor(
   } catch {
     throw new Error('keyId is not a URL')
   }
-  if (url.protocol !== 'https:') {
-    throw new Error('refusing non-https keyId')
+  if (url.protocol !== 'https:' || url.username || url.password) {
+    throw new Error('refusing unsafe keyId')
   }
-  // SSRF: reject (or DNS-resolve-and-reject) IMDS/RFC1918/loopback/etc.
-  await assertSafeRemoteUrl(url.toString(), lookupAll)
-  const res = await fetch(url.toString(), {
-    method: 'GET',
-    headers: { accept: 'application/activity+json' },
-    redirect: 'manual',
-    signal: AbortSignal.timeout(REMOTE_FETCH_TIMEOUT_MS),
-  })
+  // Fragments identify keys in the actor document and are omitted from HTTP.
+  url.hash = ''
+  const actorUrl = url.toString()
+  await assertSafeRemoteUrl(actorUrl, lookupAll)
+  const res = await fetchRemoteJsonResponse(actorUrl, 'application/activity+json', signFetch)
   if (res.status >= 300 && res.status < 400) {
     throw new Error('refusing to follow redirect on actor fetch')
   }
@@ -488,19 +503,16 @@ const MAX_JSON_REDIRECTS = 3
 export async function realFetchJson(
   url: string,
   lookupAll: DnsLookupAll = defaultDnsLookupAll,
+  signFetch?: SignRemoteGet,
 ): Promise<unknown> {
   let current = url
   for (let hop = 0; hop <= MAX_JSON_REDIRECTS; hop++) {
     await assertSafeRemoteUrl(current, lookupAll)
-    const res = await fetch(current, {
-      method: 'GET',
-      headers: {
-        accept:
-          'application/activity+json, application/ld+json; profile="https://www.w3.org/ns/activitystreams", application/jrd+json, application/json',
-      },
-      redirect: 'manual',
-      signal: AbortSignal.timeout(REMOTE_FETCH_TIMEOUT_MS),
-    })
+    const res = await fetchRemoteJsonResponse(
+      current,
+      'application/activity+json, application/ld+json; profile="https://www.w3.org/ns/activitystreams", application/jrd+json, application/json',
+      signFetch,
+    )
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location')
       if (!loc) throw new Error('redirect without location')
@@ -1022,12 +1034,22 @@ export function makeRealDeps(): ApDeps {
   const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
     marshallOptions: { removeUndefinedValues: true },
   })
+  const getApKey = (handle: string) => getOrMintApKey(apKeyRef(handle), ssm)
+  const signActorLookup = ({ handle, origin }: { handle: string; origin: string }): SignRemoteGet =>
+    async url => {
+      const { privatePem } = await getApKey(handle)
+      return signRequest({
+        method: 'GET', url, body: Buffer.alloc(0), privateKeyPem: privatePem,
+        keyId: `${origin}/ap/users/${handle}#main-key`,
+      })
+    }
+
   return {
     tenantStore,
-    getApKey: (handle: string) => getOrMintApKey(apKeyRef(handle), ssm),
+    getApKey,
     verifyRequest,
     signRequest,
-    fetchRemoteActor: realFetchRemoteActor,
+    fetchRemoteActor: (keyId, actor) => realFetchRemoteActor(keyId, defaultDnsLookupAll, signActorLookup(actor)),
     deliverActivity: realDeliverActivity,
     followers: makeFollowersStore(),
     actorCache: makeActorCache(),
@@ -1057,6 +1079,7 @@ export function makeRealDeps(): ApDeps {
     following: makeFollowingStore(ddb, process.env[AP_ENV.AP_FOLLOWING_TABLE]!),
     inbound: makeInboundStore(ddb, process.env[AP_ENV.AP_INBOUND_TABLE]!),
     fetchJson: (url) => realFetchJson(url),
+    fetchActorJson: (url, actor) => realFetchJson(url, defaultDnsLookupAll, signActorLookup(actor)),
     authenticateOwner: makeOwnerAuthenticator(tenantStore),
   }
 }

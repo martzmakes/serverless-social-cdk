@@ -21,6 +21,7 @@ export const lambdaEntries = [
   "pds/firehose-fanout",
   "pds/longform-renderer",
   "analytics/aggregate",
+  "analytics/insights",
   "analytics/capture-engagement",
 ] as const;
 
