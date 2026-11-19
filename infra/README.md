@@ -81,7 +81,9 @@ new ServerlessSocialSite(siteStack, "Site", {
 });
 ```
 
-This construct deploys a static bundle and forwards app routes to the PDS. For a tenant on a Serverless Social backend, set `pds.apiHostname` to the direct backend hostname and include the site domain in the backend's `tenantHosts`. The public `pds.hostname` supplies the default WebSocket origin. The full UI uses Serverless Social's own auth and application routes. Static longform artifacts can be supplied with the site bundle. For shared render-on-write longform, configure a `secondarySite` on the backend stack so both distributions use the same bucket and renderer.
+This construct deploys a static bundle and forwards app routes to the PDS. For a tenant on a Serverless Social backend, set `pds.apiHostname` to the direct backend hostname and include the site domain in the backend's `tenantHosts`. When both stacks are defined in one CDK app, pass the PDS stack's `apiHostname` directly. The public `pds.hostname` supplies the default WebSocket origin. The full UI uses Serverless Social's own auth and application routes. Static longform artifacts can be supplied with the site bundle. For shared render-on-write longform, configure a `secondarySite` on the backend stack so both distributions use the same bucket and renderer.
+
+For staging, set `notifyOfUpdateTargets: []` on the PDS stack to suppress relay notifications while testing commits on its firehose.
 
 ## Package verification
 

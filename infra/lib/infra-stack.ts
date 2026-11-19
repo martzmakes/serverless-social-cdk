@@ -60,6 +60,8 @@ export interface ServerlessSocialStackProps extends cdk.StackProps {
   readonly hostedZoneId?: string;
   readonly alarmEmail?: string;
   readonly tenantHosts?: readonly string[];
+  /** Relay hosts to notify after commits. Supply an empty array for isolated deployments. */
+  readonly notifyOfUpdateTargets?: readonly string[];
   readonly firehose?: FirehoseConfiguration;
   /** Optional second distribution in the same stack. Preserve the prefix for existing deployments. */
   readonly secondarySite?: {
@@ -71,6 +73,9 @@ export interface ServerlessSocialStackProps extends cdk.StackProps {
 }
 
 export class InfraStack extends cdk.Stack {
+  /** Regional backend origin for a ServerlessSocialSite attached to this deployment. */
+  readonly apiHostname: string;
+
   constructor(scope: Construct, id: string, props: ServerlessSocialStackProps) {
     super(scope, id, props);
 
@@ -1073,7 +1078,7 @@ export class InfraStack extends cdk.Stack {
           // AT-Proto relay — adding it here closes the propagation gap where
           // the relay would otherwise only learn of new commits on its own
           // reconnect cadence (observed >11h between reconnects).
-          NOTIFY_OF_UPDATE_TARGETS: "bsky.network",
+          NOTIFY_OF_UPDATE_TARGETS: (props.notifyOfUpdateTargets ?? ["bsky.network"]).join(","),
           PDS_HOSTNAME: DOMAIN,
         },
         ...lambdaSource("pds/firehose-fanout"),
@@ -1288,6 +1293,7 @@ export class InfraStack extends cdk.Stack {
       2,
       cdk.Fn.split("/", authHttpApi.apiEndpoint)
     );
+    this.apiHostname = apiOriginHost;
     // CloudFront's ALL_VIEWER_EXCEPT_HOST_HEADER origin request policy (below)
     // strips the real Host header before forwarding to API Gateway, so the
     // Lambda-side `viewerHost()` (infra/lib/lambdas/pds/handler.ts) can never
