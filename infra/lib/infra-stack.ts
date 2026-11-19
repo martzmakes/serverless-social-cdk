@@ -350,6 +350,7 @@ export class InfraStack extends cdk.Stack {
         ...authLambdaBase.environment,
         TENANTS_TABLE: tenantsTable.table.tableName,
         ADMIN_EMAIL: adminEmail,
+        PDS_HANDLE: pdsHandle,
       },
       ...lambdaSource("auth/me"),
     });

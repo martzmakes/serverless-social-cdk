@@ -50,6 +50,9 @@ const originFor = (dist, route) => dist.Origins.find(
 );
 const stream = "/xrpc/com.atproto.sync.subscribeRepos";
 
+const authMe = Object.entries(assembly.getStackByName("Standalone").template.Resources)
+  .find(([id, resource]) => id.startsWith("AuthMeHandler") && resource.Type === "AWS::Lambda::Function");
+assert.equal(authMe?.[1].Properties.Environment.Variables.PDS_HANDLE, props.domain);
 assert.equal(resources("Standalone", "AWS::EC2::Instance").length, 1);
 const registry = resources("Standalone", "AWS::SSM::Parameter")
   .find(parameter => parameter.Name === "/example-social/firehose-registry");
