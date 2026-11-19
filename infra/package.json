@@ -1,0 +1,76 @@
+{
+  "name": "@martzmakes/serverless-social",
+  "version": "0.1.0",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "vitest run",
+    "cdk": "cdk",
+    "build:package": "node scripts/build-package.cjs",
+    "prepack": "npm run build:package",
+    "test:package": "node scripts/test-package.cjs"
+  },
+  "devDependencies": {
+    "@atproto/common-web": "^0.4.21",
+    "@atproto/crypto": "^0.4.5",
+    "@atproto/lex-cbor": "^0.0.16",
+    "@atproto/lex-data": "^0.0.15",
+    "@atproto/lexicon": "^0.6.2",
+    "@atproto/repo": "^0.9.1",
+    "@atproto/syntax": "^0.5.4",
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.1048.0",
+    "@aws-sdk/client-cloudfront-keyvaluestore": "^3.1048.0",
+    "@aws-sdk/client-dynamodb": "^3.1048.0",
+    "@aws-sdk/client-s3": "^3.1048.0",
+    "@aws-sdk/client-sesv2": "^3.1024.0",
+    "@aws-sdk/client-sqs": "^3.1048.0",
+    "@aws-sdk/client-ssm": "^3.1024.0",
+    "@aws-sdk/lib-dynamodb": "^3.1048.0",
+    "@aws-sdk/signature-v4a": "^3.1048.0",
+    "@types/aws-lambda": "^8.10.161",
+    "@types/jest": "^30",
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^24.10.1",
+    "@types/qrcode": "^1.5.6",
+    "aws-cdk": "2.1117.0",
+    "aws-cdk-lib": "^2.247.0",
+    "constructs": "^10.5.0",
+    "dynamodb-local": "^0.0.38",
+    "esbuild": "^0.28.0",
+    "highlight.js": "11.12.0",
+    "jest": "^30",
+    "jose": "^6.2.3",
+    "jsdom": "^25.0.1",
+    "marked": "18.1.2",
+    "parse5": "7.3.0",
+    "qrcode": "^1.5.4",
+    "stripe": "^22.0.1",
+    "ts-jest": "^29",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.6",
+    "ws": "8.22.1"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "aws-cdk-lib": "^2.247.0",
+    "constructs": "^10.5.0"
+  },
+  "bin": {
+    "serverless-social-bootstrap": "./dist/pds-bootstrap.cjs"
+  },
+  "license": "MIT"
+}

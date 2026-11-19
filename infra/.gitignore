@@ -1,0 +1,16 @@
+*.js
+!jest.config.js
+!lib/longform-edge.js
+!lib/not-found-edge.js
+*.d.ts
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+cdk.out-local
+cdk-outputs.json
+.ap-follow-probe.json
+
+# npm package output
+/dist/

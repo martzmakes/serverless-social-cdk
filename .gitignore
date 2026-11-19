@@ -1,0 +1,27 @@
+node_modules/
+*.log
+.DS_Store
+.env
+.env.local
+.env.*.local
+
+# CDK
+cdk.out/
+.cdk.staging/
+infra/cdk-outputs.json
+
+# Expo
+app/.expo/
+app/dist/
+app/web-build/
+app/expo-env.d.ts
+
+# Native build secrets
+google-service-account-key.json
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# TypeScript
+*.tsbuildinfo

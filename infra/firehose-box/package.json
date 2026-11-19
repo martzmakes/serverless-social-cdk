@@ -1,0 +1,17 @@
+{
+  "name": "serverless-social-firehose-box",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "build": "node build.js",
+    "start": "node dist/server.bundle.cjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1048.0",
+    "@aws-sdk/client-ssm": "^3.1048.0",
+    "@aws-sdk/lib-dynamodb": "^3.1048.0"
+  },
+  "devDependencies": {
+    "ws": "^8.22.1"
+  }
+}

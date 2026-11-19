@@ -1,0 +1,3 @@
+firehose.serverless.social {
+  reverse_proxy localhost:8080
+}

@@ -1,0 +1,3 @@
+# Override infra/.gitignore for the box (which ships .js source, not compiled .ts)
+!*.js
+node_modules
