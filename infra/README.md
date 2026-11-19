@@ -40,12 +40,14 @@ Bootstrap the AWS environment and create these SSM SecureString parameters under
 | `/atproto-signing-key` | Hex-encoded secp256k1 private key kept for this PDS identity |
 | `/app-password` | Optional password for first-party XRPC `createSession` |
 
-After `cdk deploy`, verify SES DKIM and production sending access. Initialize the repository from the AWS environment that owns the stack:
+After `cdk deploy`, verify SES DKIM and production sending access. Initialize the repository from the AWS environment that owns the stack. Set `REPO_TABLE` to the physical table name in the stack’s `RepoTableName` output.
 
 ```sh
 AWS_REGION=us-east-1 PDS_HANDLE=social.example.com PROJECT_SLUG=example-social \
-  REPO_TABLE=<RepoTableName-output> npx --no-install serverless-social-bootstrap
-``` Use the same domain and project slug on subsequent deployments.
+  REPO_TABLE='your-physical-repo-table-name' npx --no-install serverless-social-bootstrap
+```
+
+Use the same domain and project slug on subsequent deployments.
 
 ## Reuse an existing firehose
 
@@ -64,10 +66,12 @@ The existing box owner registers the instance ID, repo table and DID in the box'
 ## Deploy a site against an existing PDS
 
 ```ts
-import { Stack } from "aws-cdk-lib";
+import { App, Stack } from "aws-cdk-lib";
 import { HostedZone } from "aws-cdk-lib/aws-route53";
+import { resolve } from "node:path";
 import { ServerlessSocialSite } from "@martzmakes/serverless-social";
 
+const app = new App();
 const siteStack = new Stack(app, "PersonalSite", {
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: "us-east-1" },
 });

@@ -1,6 +1,12 @@
 {
   "name": "@martzmakes/serverless-social",
   "version": "0.1.0",
+  "description": "AWS CDK constructs for an AT Protocol PDS, shared firehose, and static sites",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/martzmakes/serverless-social-cdk.git",
+    "directory": "infra"
+  },
   "scripts": {
     "build": "tsc",
     "watch": "tsc -w",
