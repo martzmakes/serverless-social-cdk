@@ -131,9 +131,10 @@ export interface DeliveryLedger {
    */
   claim(key: string): Promise<boolean | 'inflight'>
   /** Mark a claimed key permanently done (delivered or permanently rejected). */
-  complete(key: string): Promise<void>
+  complete(key: string, outcome?: CompletedDelivery): Promise<void>
   /** Release a claim so a retry can send it again. */
   release(key: string): Promise<void>
+  result?(key: string): Promise<CompletedDelivery | undefined>
 }
 
 export interface LongformIndexEntry {
@@ -170,6 +171,7 @@ export interface DeliverDeps {
     text?: string
     createdAt?: string
     facets?: any[]
+    reply?: boolean
     embed?: { external?: { uri?: string } }
   } | null>
 
@@ -181,6 +183,8 @@ export interface DeliverDeps {
    * renderer has not written one yet. The slug there is the page that exists.
    */
   getLongformIndex(did: string, rkey: string): Promise<LongformIndexEntry | null>
+
+  isBlueskyOnly?(did: string, rkey: string): Promise<boolean>
 
   /**
    * True when this feed.post is the renderer's syndication link post for a
@@ -373,6 +377,7 @@ async function buildActivity(
   const followers = `${actorId}/followers`
 
   if (ev.op === 'delete') {
+    if (collection === COLL_POST && await deps.isBlueskyOnly?.(did, rkey)) return null
     const del = wrapDelete(actorId, objectId, [AS_PUBLIC], [followers], `${objectId}#delete`)
     return { id: del.id, doc: { '@context': AS_CONTEXT, ...del } }
   }
@@ -423,6 +428,7 @@ async function buildActivity(
       logSkip('record_not_found', ev, handle)
       return null
     }
+    if ((record.reply || ev.op === 'update') && await deps.isBlueskyOnly?.(did, rkey)) return null
     const embedUri = record.embed?.external?.uri
     if (
       typeof embedUri === 'string' &&
@@ -540,12 +546,9 @@ export interface DeliverJob {
   body: Buffer
 }
 
-export type DeliveryOutcome =
-  | 'delivered'
-  | 'duplicate'
-  | 'gone'
-  | 'rejected'
-  | 'retry_queued'
+export type CompletedDelivery = 'delivered' | 'gone' | 'rejected'
+export type DeliveryOutcome = CompletedDelivery | 'duplicate' | 'retry_queued'
+export type DeliveryTransport = Pick<DeliverDeps, 'ledger' | 'retryQueue' | 'signRequest' | 'postFetch' | 'followers'>
 
 /** 429/408 and 5xx are transient; any other non-2xx is the remote saying no. */
 export function isRetryableStatus(status: number): boolean {
@@ -565,7 +568,7 @@ export function isRetryableStatus(status: number): boolean {
 export async function deliverOne(
   job: DeliverJob,
   signer: { keyId: string; privatePem: string },
-  deps: DeliverDeps,
+  deps: DeliveryTransport,
   mode: DeliverMode,
 ): Promise<DeliveryOutcome> {
   const { handle, activityId, inbox, actorIds, body } = job
@@ -620,12 +623,12 @@ export async function deliverOne(
   }
 
   if (status !== undefined && status >= 200 && status < 300) {
-    await deps.ledger.complete(key)
+    await deps.ledger.complete(key, 'delivered')
     return 'delivered'
   }
   if (status === 410) {
     for (const id of actorIds) await deps.followers.remove(handle, id)
-    await deps.ledger.complete(key)
+    await deps.ledger.complete(key, 'gone')
     console.log(
       JSON.stringify({ at: 'ap.deliver', event: 'follower_removed_410', handle, inbox }),
     )
@@ -647,7 +650,7 @@ export async function deliverOne(
   )
 
   if (!retryable) {
-    await deps.ledger.complete(key)
+    await deps.ledger.complete(key, 'rejected')
     return 'rejected'
   }
 

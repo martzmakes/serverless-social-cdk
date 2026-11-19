@@ -9,10 +9,13 @@ const db = vi.hoisted(() => {
   process.env.POST_ANALYTICS_TABLE = "reports";
   process.env.SITE_BUCKET = "pages";
   process.env.AP_INBOUND_TABLE = "ap-inbound";
+  process.env.REPLY_API_ORIGIN = "https://api.example.net";
   process.env.AP_CUSTOM_HOSTS = "writer.example.net";
-  return { send: vi.fn(), readPage: vi.fn() };
+  return { send: vi.fn(), readPage: vi.fn(), mint: vi.fn() };
 });
+vi.mock("../lib/lambdas/auth/session-mint", () => ({ mintFirstPartySessionFor: db.mint }));
 vi.mock("../lib/lambdas/auth/lib/jwt", () => ({
+  loadAppJwtKey: async () => new Uint8Array([1, 2, 3]),
   verifyJwt: async (token: string) => {
     if (token !== "valid") throw new Error("Invalid token");
     return { email: "owner@example.net" };
@@ -38,13 +41,19 @@ import { handler } from "../lib/lambdas/analytics/insights";
 import { parseCloudFrontLog } from "../lib/lambdas/analytics/log-parse";
 import { taggedArticleUrl } from "../insights";
 
+const rootCid = "bafy" + "a".repeat(54);
+const remoteCid = "bafy" + "b".repeat(54);
+const remoteBskyUri = "at://did:plc:subscriber/app.bsky.feed.post/reply1";
+const remoteApUri = "https://mastodon.example/@qa/1";
+const ownerDid = "did:plc:writer";
+const requestId = "d79baf35-8709-4c9c-92f9-85b561438fdc";
 const article = {
   rkey: "post1",
   title: "An article",
   status: "published",
   currentSlug: "an-article",
   publishedAt: "2026-11-16T12:00:00Z",
-  syndication: { bsky: { uri: "at://did:plc:writer/app.bsky.feed.post/thread1" } },
+  syndication: { bsky: { uri: "at://did:plc:writer/app.bsky.feed.post/thread1", cid: rootCid } },
 };
 
 function event(path: string, query?: Record<string, string>, rkey?: string, authorization = "Bearer valid") {
@@ -53,6 +62,13 @@ function event(path: string, query?: Record<string, string>, rkey?: string, auth
     headers: { authorization },
     queryStringParameters: query,
     pathParameters: rkey ? { rkey } : undefined,
+  } as unknown as APIGatewayProxyEventV2;
+}
+
+function replyAction(body: object, did = ownerDid, rkey = article.rkey) {
+  return {
+    ...event(`/articles/${rkey}/replies`, { did }, rkey),
+    requestContext: { http: { method: "POST" } }, body: JSON.stringify(body),
   } as unknown as APIGatewayProxyEventV2;
 }
 
@@ -95,6 +111,8 @@ describe("author insights", () => {
   beforeEach(() => {
     db.send.mockReset();
     db.readPage.mockReset();
+    db.mint.mockReset();
+    db.mint.mockImplementation(async (_email, did) => ({ did, accessJwt: `fixture-for:${did}` }));
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-11-19T12:00:00Z"));
   });
@@ -183,7 +201,12 @@ describe("author insights", () => {
       sortKey: "post1#2026-11-19T11:00:00.000Z#ad6abcdef1234567", ttl: 1_900_000_000,
       item: { id: "https://mastodon.example/@qa/1", url: "https://mastodon.example/@qa/1", published: "2026-11-19T11:00:00Z",
         actor: { handle: "mastodon.example" }, content: "<p>Fediverse &amp; Bluesky</p>" },
-    }] });
+    }] }).mockImplementationOnce(async command => {
+      const keys = command.input.RequestItems.reports.Keys;
+      expect(keys).toHaveLength(2);
+      expect(keys.every((key: { pk: string; sk: string }) => key.pk === `REPLY_STATE#${ownerDid}` && key.sk.startsWith("post1#"))).toBe(true);
+      return { Responses: { reports: [keys[1]] } };
+    });
     const response = await handler(event("/articles/post1/replies", { did: "did:plc:writer" }, "post1"));
     expect(response.statusCode).toBe(200);
     expect(db.send.mock.calls[1][0].input).toMatchObject({
@@ -191,8 +214,86 @@ describe("author insights", () => {
       ExpressionAttributeValues: { ":pk": "writer.example.net#article-replies", ":first": "post1#" },
     });
     expect(JSON.parse(response.body)).toMatchObject({ replies: [
-      { network: "Bluesky", text: "A Bluesky reply" }, { network: "Fediverse", text: "Fediverse & Bluesky" },
+      { network: "Bluesky", text: "A Bluesky reply", handled: false }, { network: "Fediverse", text: "Fediverse & Bluesky", handled: true },
     ], unavailable: [] });
+  });
+
+  it("keeps handled status private and scoped to a visible reply, and allows reopening", async () => {
+    const parent = {
+      sortKey: "post1#2026-11-19T11:00:00.000Z#ad6abcdef1234567", ttl: 1_900_000_000,
+      owner: "https://mastodon.example/users/qa",
+      item: { id: remoteApUri, actor: { id: "https://mastodon.example/users/qa" } },
+    };
+    const action = { action: "handled", network: "Fediverse", id: remoteApUri, handled: true };
+    expect((await handler(replyAction(action, "did:plc:other"))).statusCode).toBe(403);
+    expect(db.send).not.toHaveBeenCalled();
+    db.send.mockResolvedValueOnce({ Item: { item: article } }).mockResolvedValueOnce({ Item: { ...parent, sortKey: "other#timestamp" } });
+    expect((await handler(replyAction(action))).statusCode).toBe(422);
+    expect(db.send).toHaveBeenCalledTimes(2);
+
+    db.send.mockResolvedValueOnce({ Item: { item: article } }).mockResolvedValueOnce({ Item: parent }).mockResolvedValueOnce({});
+    expect(JSON.parse((await handler(replyAction(action))).body)).toEqual({ handled: true });
+    const handled = db.send.mock.calls[4][0].input.Item;
+    expect(handled).toEqual({ pk: `REPLY_STATE#${ownerDid}`, sk: expect.stringMatching(/^post1#[0-9a-f]{64}$/) });
+    db.send.mockResolvedValueOnce({ Item: { item: article } }).mockResolvedValueOnce({ Item: parent }).mockResolvedValueOnce({});
+    expect(JSON.parse((await handler(replyAction({ ...action, handled: false }))).body)).toEqual({ handled: false });
+    expect(db.send.mock.calls[7][0].input.Key).toEqual(handled);
+    expect(db.mint).not.toHaveBeenCalled();
+  });
+
+  it("writes a real AT reply from the selected DID and recovers an ambiguous response with the same key", async () => {
+    let record: { rkey: string; record: object } | undefined;
+    const root = article.syndication.bsky;
+    const fetchNetwork = vi.fn(async (target: URL, init?: RequestInit) => {
+      if (target.hostname === "public.api.bsky.app") {
+        expect(target.pathname).toBe("/xrpc/app.bsky.feed.getPosts");
+        expect(target.searchParams.get("uris")).toBe(remoteBskyUri);
+        return Response.json({ posts: [{ uri: remoteBskyUri, cid: remoteCid, record: { reply: { root } } }] });
+      }
+      expect(target.hostname).toBe("api.example.net");
+      expect(new Headers(init?.headers).get("Authorization")).toBe(`Bearer fixture-for:${ownerDid}`);
+      if (target.pathname.endsWith("putRecord")) {
+        record = JSON.parse(String(init?.body));
+        expect(record).toMatchObject({
+          repo: ownerDid, collection: "app.bsky.feed.post", swapRecord: null,
+          record: { text: "Thanks for reading", reply: { root, parent: { uri: remoteBskyUri, cid: remoteCid } } },
+        });
+        expect(db.send.mock.calls.at(-1)?.[0].input.Item).toMatchObject({ pk: `bluesky-only#${ownerDid}`, sk: record!.rkey });
+        return new Response("connection interrupted", { status: 502 });
+      }
+      expect(target.searchParams.get("rkey")).toBe(record?.rkey);
+      return Response.json({ uri: `at://${ownerDid}/app.bsky.feed.post/${record!.rkey}`, value: record!.record });
+    });
+    vi.stubGlobal("fetch", fetchNetwork);
+    db.send.mockResolvedValueOnce({ Item: { item: article } }).mockResolvedValueOnce({}).mockResolvedValueOnce({}).mockResolvedValueOnce({});
+    const input = { action: "send", network: "Bluesky", id: remoteBskyUri, text: "Thanks for reading", requestId };
+    const response = await handler(replyAction(input));
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body)).toMatchObject({ status: "sent", url: expect.stringMatching(/^https:\/\/bsky\.app/) });
+    expect(db.mint).toHaveBeenCalledWith("owner@example.net", ownerDid, expect.anything());
+    const savedIntent = db.send.mock.calls[2][0].input.Item;
+    db.send.mockResolvedValueOnce({ Item: { item: article } }).mockResolvedValueOnce({ Item: savedIntent }).mockResolvedValueOnce({});
+    const retried = await handler(replyAction(input));
+    expect(JSON.parse(retried.body)).toEqual(JSON.parse(response.body));
+    expect(fetchNetwork.mock.calls.filter(([url]) => url.hostname === "public.api.bsky.app")).toHaveLength(1);
+
+    db.send.mockResolvedValueOnce({ Item: { item: article } }).mockResolvedValueOnce({ Item: savedIntent });
+    expect((await handler(replyAction({ ...input, text: "Different" }))).statusCode).toBe(409);
+  });
+
+  it("sends Fediverse replies through the owner-scoped AP route and preserves the queued outcome", async () => {
+    db.send.mockResolvedValueOnce({ Item: { item: article } });
+    const fetchNetwork = vi.fn(async (url: URL, req: RequestInit) => {
+      expect(url.href).toBe("https://api.example.net/ap/users/writer.example.net/replies");
+      expect(new Headers(req.headers).get("Authorization")).toBe(`Bearer fixture-for:${ownerDid}`);
+      expect(JSON.parse(String(req.body))).toEqual({ articleRkey: article.rkey, parentId: remoteApUri, text: "Appreciate it", requestId });
+      return Response.json({ status: "queued", url: `https://writer.example.net/ap/users/writer.example.net/replies/${requestId}` }, { status: 202 });
+    });
+    vi.stubGlobal("fetch", fetchNetwork);
+    const result = await handler(replyAction({ action: "send", network: "Fediverse", id: remoteApUri, text: "Appreciate it", requestId }));
+    expect(result.statusCode).toBe(200);
+    expect(JSON.parse(result.body)).toMatchObject({ status: "queued" });
+    expect(fetchNetwork).toHaveBeenCalledTimes(1);
   });
 
   it("does not read traffic for a deleted article", async () => {

@@ -1,9 +1,12 @@
 import { generateKeyPairSync } from 'node:crypto'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { dispatch, type ApDeps } from '../lib/lambdas/ap/handler'
-import { realFetchJson, realFetchRemoteActor } from '../lib/lambdas/ap-deps'
+import { outboxIndexFromItems, realFetchJson, realFetchRemoteActor } from '../lib/lambdas/ap-deps'
 import type { FollowingRow } from '../lib/lambdas/ap/following'
 import { articleRepliesPartition, ingestArticleReply, type InboundRecord } from '../lib/lambdas/ap/ingest'
+import type { OutgoingArticleReply } from '../lib/lambdas/ap/article-replies'
+import { deliverOne, processOne, type DeliverDeps } from '../lib/lambdas/ap/deliver'
+import { wrapCreate } from '../lib/lambdas/ap/outbox'
 import { parseSignatureHeader, signRequest, verifyRequest } from '../lib/lambdas/ap/httpsig'
 
 const keys = () => generateKeyPairSync('rsa', {
@@ -260,4 +263,122 @@ it('records article replies from a verified non-followee and rejects private, fo
   expect(await ingestArticleReply('Update', { object: { ...note, to: [origin] } }, ctx)).toBe('deleted')
   expect(await ingestArticleReply('Delete', { object: uri }, ctx)).toBe('deleted')
   expect(remove).toHaveBeenCalledTimes(2)
+})
+
+it('authorizes the addressed AP identity, sends a signed threaded reply, and routes a response back to the article', async () => {
+  const did = 'did:plc:example'
+  const handle = 'martzmakes.com'
+  const origin = `https://${handle}`
+  const actor = `${origin}/ap/users/${handle}`
+  const apParent = remote + '/statuses/reply'
+  const apRecord: InboundRecord = {
+    key: 'stored', sortKey: 'post1#2026-11-19T18:44:00.000Z#abcdef0123456789',
+    owner: remote, ttl: Math.floor(Date.now() / 1000) + 1000,
+    item: { id: apParent, url: apParent, actor: { id: remote, handle: 'test@mastodon.example' }, content: '<p>Reply</p>',
+      published: new Date().toISOString(), attachments: [] },
+  }
+  const saved = new Map<string, OutgoingArticleReply>()
+  const received = vi.fn(async (_handle: string, _record: InboundRecord) => true)
+  const ledger = new Set<string>()
+  const accepted = vi.fn(async (to: string, opts: { headers: Record<string, string>; body: Buffer }) => {
+    expect(to).toBe(inbox)
+    expect(await verifyRequest({ method: 'POST', path: new URL(inbox).pathname, headers: opts.headers, body: opts.body }, publisher.publicKey)).toBe(true)
+    expect(JSON.parse(opts.body.toString())).toMatchObject({
+      actor, type: 'Create', object: { type: 'Note', attributedTo: actor, inReplyTo: apParent, content: '<p>Thanks &lt;friend&gt;</p>',
+        to: [remote], cc: ['https://www.w3.org/ns/activitystreams#Public'],
+        tag: [{ type: 'Mention', href: remote, name: '@test@mastodon.example' }],
+      },
+    })
+    return { status: 202 }
+  })
+  const deps: ApDeps = {
+    tenantStore: { byHandle: async name => ({ did, handle: name, status: 'active' }), byDid: async () => null, listActive: async () => [] },
+    customHosts: [handle],
+    getApKey: async () => ({ privatePem: publisher.privateKey, publicPem: publisher.publicKey }),
+    authenticateOwner: async auth => auth === 'Bearer writer' ? did : 'did:plc:other',
+    verifyRequest, signRequest, deliverActivity: async () => { throw new Error('No short-post or follow delivery expected') },
+    fetchRemoteActor: async () => ({ id: remote, inbox, publicKeyPem: follower.publicKey }),
+    actorCache: { get: async () => null, put: async () => {} },
+    followers: { add: async () => {}, remove: async () => {}, list: async () => [] },
+    following: { get: async () => null, put: async () => {}, setAccepted: async () => false, remove: async () => {}, list: async () => [] },
+    fetchJson: async () => { throw new Error('Unexpected object lookup') },
+    inbound: { putIfAbsent: received, page: async () => ({ records: [] }), update: async () => false, remove: async () => false },
+    getArticle: async (selected, key) => selected === did && key === 'post1'
+      ? { slug: 'article', record: { title: 'Article', slug: 'article', content: 'body', createdAt: new Date().toISOString() } } : null,
+    listOutbox: async () => ({ records: [] }), countOutbox: async () => 0, getOutboxPost: async () => null,
+    articleReplies: {
+      incoming: async (owner, id) => owner === handle && id === apParent ? apRecord : undefined,
+      outgoing: async (owner, id) => owner === handle ? saved.get(id) : undefined,
+      putOutgoing: async (_owner, item) => {
+        if (saved.has(item.requestId)) return false
+        saved.set(item.requestId, item)
+        return true
+      },
+    },
+    deliverArticleReply: (owner, author, item) => {
+      const create = wrapCreate(author, item.note)
+      return deliverOne({
+        handle: owner, activityId: create.id, inbox: item.inbox, actorIds: [],
+        body: Buffer.from(JSON.stringify(create)),
+      }, { keyId: actor + '#main-key', privatePem: publisher.privateKey }, {
+        followers: { list: async () => [], remove: async () => {} },
+        ledger: {
+          claim: async key => !ledger.has(key), complete: async key => { ledger.add(key) }, release: async () => {},
+        },
+        retryQueue: { enqueue: async () => { throw new Error('Unexpected retry') } },
+        signRequest, postFetch: accepted,
+      }, 'stream')
+    },
+  }
+  const requestId = 'd79baf35-8709-4c9c-92f9-85b561438fdc'
+  const url = actor + '/replies'
+  const body = { articleRkey: 'post1', parentId: apParent, text: 'Thanks <friend>', requestId }
+  const request = (value: object, token = 'writer') => dispatch({
+    method: 'POST', url, path: new URL(url).pathname, query: {},
+    headers: { authorization: 'Bearer ' + token }, rawBody: Buffer.from(JSON.stringify(value)),
+  }, deps)
+  expect((await request(body, 'other')).status).toBe(401)
+  expect((await request({ ...body, articleRkey: 'other' })).status).toBe(422)
+  const sent = await request(body)
+  expect(JSON.parse(sent.body)).toEqual({ status: 'sent', url: `${url}/${requestId}` })
+  await request(body)
+  expect((await request({ ...body, text: 'different' })).status).toBe(409)
+  expect(accepted).toHaveBeenCalledTimes(1)
+  const outUrl = `${url}/${requestId}`
+  const object = await dispatch({ method: 'GET', url: outUrl, path: new URL(outUrl).pathname, query: {}, headers: {}, rawBody: Buffer.alloc(0) }, deps)
+  expect(object.status).toBe(200)
+  expect(JSON.parse(object.body)).toMatchObject({ id: outUrl, attributedTo: actor, inReplyTo: apParent })
+
+  const inboxUrl = actor + '/inbox'
+  const inbound = Buffer.from(JSON.stringify({ type: 'Create', actor: remote, object: {
+    type: 'Note', id: remote + '/statuses/reply-to-reply',
+    attributedTo: remote, inReplyTo: outUrl, content: '<p>Thanks!</p>', cc: ['https://www.w3.org/ns/activitystreams#Public'],
+  } }))
+  const headers = lowercase(await signRequest({ method: 'POST', url: inboxUrl, body: inbound, keyId, privateKeyPem: follower.privateKey }))
+  const inboundResult = await dispatch({
+    method: 'POST', url: inboxUrl, path: new URL(inboxUrl).pathname, query: {}, headers, rawBody: inbound,
+  }, deps)
+  expect(inboundResult.status).toBe(202)
+  expect(received).toHaveBeenCalledExactlyOnceWith(articleRepliesPartition(handle), expect.objectContaining({
+    owner: remote, sortKey: expect.stringMatching(/^post1#/),
+  }))
+})
+
+it('keeps control-room Bluesky replies out of AP push delivery and the outbox', async () => {
+  const did = 'did:plc:example'
+  const sender = vi.fn()
+  const deps: DeliverDeps = {
+    resolveHandle: async () => ({ handle: 'martzmakes.com' }),
+    loadPostRecord: async () => ({ text: 'a reply', reply: true }),
+    loadLongform: async () => null, getLongformIndex: async () => null,
+    isSyndicationLink: async () => false,
+    isBlueskyOnly: async (selected, rkey) => selected === did && rkey === 'blue-only',
+    followers: { list: async () => [{ actorId: remote, inbox }], remove: async () => {} },
+    ledger: { claim: async () => true, complete: async () => {}, release: async () => {} },
+    retryQueue: { enqueue: async () => {} },
+    getApKey: async () => ({ privatePem: publisher.privateKey }), signRequest, postFetch: sender,
+  }
+  for (const op of ['create', 'update', 'delete'] as const) await processOne({ did, rkey: 'blue-only', op }, deps, 'stream')
+  expect(sender).not.toHaveBeenCalled()
+  expect(outboxIndexFromItems([], ['blue-only']).suppressedPostRkeys).toEqual(new Set(['blue-only']))
 })

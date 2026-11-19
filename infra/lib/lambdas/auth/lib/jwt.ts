@@ -9,7 +9,7 @@ const TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 
 let cachedKey: Uint8Array | null = null;
 
-async function getKey(): Promise<Uint8Array> {
+export async function loadAppJwtKey(): Promise<Uint8Array> {
   if (cachedKey) return cachedKey;
   const res = await ssm.send(
     new GetParameterCommand({ Name: SECRET_NAME, WithDecryption: true })
@@ -21,7 +21,7 @@ async function getKey(): Promise<Uint8Array> {
 }
 
 export async function mintJwt(email: string): Promise<string> {
-  const key = await getKey();
+  const key = await loadAppJwtKey();
   return await new SignJWT({})
     .setProtectedHeader({ alg: "HS256" })
     .setSubject(email)
@@ -33,7 +33,7 @@ export async function mintJwt(email: string): Promise<string> {
 }
 
 export async function verifyJwt(token: string): Promise<{ email: string }> {
-  const key = await getKey();
+  const key = await loadAppJwtKey();
   const { payload } = await jwtVerify(token, key, {
     issuer: ISSUER,
     audience: AUDIENCE,

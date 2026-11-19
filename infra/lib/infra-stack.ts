@@ -795,6 +795,7 @@ export class InfraStack extends cdk.Stack {
       ...lambdaDefaults.environment,
       AP_RETRY_QUEUE_URL: apDeliveryRetryQueue.queueUrl,
       AP_LEDGER_TABLE: apDeliveryLedgerTable.tableName,
+      AP_INBOUND_TABLE: apInboundPostsTable.tableName,
       LONGFORM_INDEX_TABLE: longformIndex.table.tableName,
       REPO_TABLE: repoTable.table.tableName,
       TENANTS_TABLE: tenantsTable.table.tableName,
@@ -836,7 +837,6 @@ export class InfraStack extends cdk.Stack {
         // Task 11 owner routes: this handler alone owns these tables, and
         // verifies the first-party session JWT (same secret as /xrpc).
         AP_FOLLOWING_TABLE: apFollowingTable.tableName,
-        AP_INBOUND_TABLE: apInboundPostsTable.tableName,
         JWT_SECRET_PARAM: JWT_SECRET_NAME,
       },
       ...lambdaSource("ap/handler"),
@@ -846,14 +846,14 @@ export class InfraStack extends cdk.Stack {
     // (outbox projection), tenants READ incl. the byHandle GSI.
     apFollowersTable.grantReadWriteData(apHandler);
     apActorCacheTable.grantReadWriteData(apHandler);
+    apDeliveryLedgerTable.grantReadWriteData(apHandler);
     repoTable.table.grantReadData(apHandler);
     tenantsTable.table.grantReadData(apHandler); // covers byHandle GSI
     apHandler.addToRolePolicy(apSsmPolicy);
     // Outbox/articles read the renderer's index; a failed Accept is queued.
     longformIndex.table.grantReadData(apHandler);
     apDeliveryRetryQueue.grantSendMessages(apHandler);
-    // Task 11, least privilege: exact item/query actions only. No Scan, no
-    // Batch*, no table-wide management; ApDelivery / ApDeliveryRetry get nothing.
+    // Item and index access for the signed-in timeline and ActivityPub article replies.
     apHandler.addToRolePolicy(
       new iam.PolicyStatement({
         actions: [
@@ -869,6 +869,7 @@ export class InfraStack extends cdk.Stack {
     apHandler.addToRolePolicy(
       new iam.PolicyStatement({
         actions: [
+          "dynamodb:GetItem",
           "dynamodb:PutItem",
           "dynamodb:UpdateItem",
           "dynamodb:DeleteItem",
@@ -1002,6 +1003,13 @@ export class InfraStack extends cdk.Stack {
     tenantsTable.table.grantReadData(apDeliveryRetry);
     longformIndex.table.grantReadData(apDeliveryRetry);
     apDeliveryLedgerTable.grantReadWriteData(apDeliveryRetry);
+    for (const worker of [apDelivery, apDeliveryRetry]) {
+      worker.addToRolePolicy(new iam.PolicyStatement({
+        actions: ["dynamodb:GetItem"],
+        resources: [apInboundPostsTable.tableArn],
+        conditions: { "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["bluesky-only#*"] } },
+      }));
+    }
     apDeliveryRetry.addToRolePolicy(apSsmPolicy);
     // Receive/Delete/ChangeMessageVisibility/GetQueueAttributes only.
     apDeliveryRetryQueue.grantConsumeMessages(apDeliveryRetry);
@@ -1425,6 +1433,7 @@ export class InfraStack extends cdk.Stack {
 
     const postInsights = new lambda.NodejsFunction(this, "PostInsights", {
       ...lambdaDefaults,
+      timeout: cdk.Duration.seconds(27),
       environment: {
         DOMAIN,
         PROJECT_SLUG,
@@ -1438,6 +1447,7 @@ export class InfraStack extends cdk.Stack {
         SITE_BUCKET: siteBucket.bucketName,
         AP_CUSTOM_HOSTS: KNOWN_TENANT_HOSTS,
         AP_INBOUND_TABLE: apInboundPostsTable.tableName,
+        REPLY_API_ORIGIN: authHttpApi.apiEndpoint,
       },
       ...lambdaSource("analytics/insights"),
     });
@@ -1451,12 +1461,30 @@ export class InfraStack extends cdk.Stack {
       resources: [`${apInboundPostsTable.tableArn}/index/byPublished`],
     }));
 
+    postInsights.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:PutItem", "dynamodb:DeleteItem"],
+      resources: [postAnalytics.table.tableArn],
+      conditions: { "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["REPLY_STATE#*", "REPLY_SEND#*"] } },
+    }));
+    postInsights.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:GetItem"],
+      resources: [apInboundPostsTable.tableArn],
+      conditions: { "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["*#article-replies"] } },
+    }));
+    postInsights.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:PutItem"],
+      resources: [apInboundPostsTable.tableArn],
+      conditions: { "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["bluesky-only#*"] } },
+    }));
+
+    const replyPath = "/auth/insights/articles/{rkey}/replies";
     const insightsIntegration = new apigwv2Integrations.HttpLambdaIntegration("PostInsightsIntegration", postInsights);
     for (const path of [
       "/auth/insights", "/auth/insights/articles", "/auth/insights/articles/{rkey}", "/auth/insights/articles/{rkey}/distribution",
-      "/auth/insights/articles/{rkey}/replies",
+      replyPath,
     ]) {
-      authHttpApi.addRoutes({ path, methods: [apigwv2.HttpMethod.GET], integration: insightsIntegration });
+      const methods = path === replyPath ? [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST] : [apigwv2.HttpMethod.GET];
+      authHttpApi.addRoutes({ path, methods, integration: insightsIntegration });
     }
 
     const analyticsAggregate = new lambda.NodejsFunction(

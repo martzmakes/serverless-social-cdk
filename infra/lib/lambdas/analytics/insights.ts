@@ -10,6 +10,7 @@ import { verifyJwt } from "../auth/lib/jwt";
 import { articleRepliesPartition, type TimelineItem } from "../ap/ingest";
 import { safeHttpsUrl } from "../ap/sanitize";
 import { canonicalApOrigin, parseCustomHosts } from "../ap/host";
+import { applyReplyAction, blueskyLink, readHandled, readReplyAction, ReplyActionError } from "./reply-actions";
 import type { IndexItem } from "../pds/longform-index";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -30,6 +31,9 @@ const entitlements = {
   tenantsTable: process.env.TENANTS_TABLE!,
   allowedEmails: (process.env.ALLOWED_EMAILS ?? "").split(",").map(email => email.trim()).filter(Boolean),
 };
+const replyContext = {
+  entitlements, analyticsTable, inboundTable, apiOrigin: process.env.REPLY_API_ORIGIN!,
+};
 const recordKey = /^(?!\.{1,2}$)[A-Za-z0-9._~:-]{1,512}$/;
 const MS_PER_DAY = 86_400_000;
 const base = "/auth/insights";
@@ -47,11 +51,6 @@ function json(statusCode: number, value: unknown) {
 }
 
 const bskyUri = /^at:\/\/(did:[a-z]+:[a-z0-9.:%-]+)\/app\.bsky\.feed\.post\/([a-z0-9._~:-]+)$/i;
-function blueskyLink(uri: string) {
-  const match = bskyUri.exec(uri);
-  return match ? `https://bsky.app/profile/${encodeURIComponent(match[1])}/post/${encodeURIComponent(match[2])}` : undefined;
-}
-
 function getArticle(item: IndexItem | undefined, site: InsightSite): InsightArticle | undefined {
   if (item?.status !== "published" || !/^[a-z0-9-]+$/.test(item.currentSlug)) return;
   const blueskyUrl = blueskyLink(item.syndication?.bsky?.uri ?? "");
@@ -277,6 +276,10 @@ export async function handler(event: APIGatewayProxyEventV2) {
   const session = bearer && await verifyJwt(bearer[1]).catch(() => undefined);
   if (!session) return json(401, { message: "Sign in to view article analytics." });
   const path = event.rawPath.replace(/\/$/, "");
+  const method = event.requestContext?.http?.method ?? "GET";
+  if (method !== "GET" && !(method === "POST" && path.endsWith("/replies"))) {
+    return json(405, { message: "Unsupported article action." });
+  }
   if (path !== base && !path.startsWith(`${base}/articles`)) return json(404, { message: "Analytics route unavailable." });
 
   try {
@@ -319,16 +322,31 @@ export async function handler(event: APIGatewayProxyEventV2) {
     const article = getArticle(item, site);
     if (!item || !article) return json(404, { message: "This article is unavailable." });
     if (isReplies) {
+      if (method === "POST") {
+        if (event.body && Buffer.byteLength(event.body) > 7000) return json(413, { message: "Reply request too large." });
+        let payload: unknown;
+        try {
+          payload = JSON.parse(event.body ?? "");
+        } catch {
+          return json(400, { message: "Enter a valid reply action." });
+        }
+        return json(200, await applyReplyAction(replyContext, session.email, site, item, readReplyAction(payload)));
+      }
       const after = params.after;
       if (after && (!after.startsWith(`${rkey}#`) ||
           !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z#[a-f0-9]{16}$/.test(after.slice(rkey.length + 1)))) {
         return json(400, { message: "Invalid reply cursor." });
       }
-      return json(200, await articleReplies(site, item, after));
+      const page = await articleReplies(site, item, after);
+      return json(200, { ...page, replies: await readHandled(replyContext, site.did, item.rkey, page.replies) });
     }
     return json(200, await (isDistribution ? distribution(site, item, article) : report(site, item, article, Number(days))));
   } catch (error) {
-    console.error("Failed to load article insights", error instanceof Error ? error.name : "UnknownError");
-    return json(500, { message: "Could not load analytics. Try again shortly." });
+    if (error instanceof ReplyActionError) return json(error.status, { message: error.message });
+    console.error("Article insights request failed", error instanceof Error ? error.name : "UnknownError");
+    const message = method === "POST"
+      ? "Couldn't confirm the reply action. Retry to check the same submission."
+      : "Could not load analytics. Try again shortly.";
+    return json(500, { message });
   }
 }

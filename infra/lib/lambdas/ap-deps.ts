@@ -63,6 +63,9 @@ import { APEX_DID } from './pds/tenant-keys'
 import { verifyXrpcAuth } from './pds/access-verify'
 import type { ApFollowingStore, FollowingRow } from './ap/following'
 import type { ApInboundStore, InboundRecord } from './ap/ingest'
+import { blueskyOnlyPartition, incomingArticleReplyKey, outgoingRepliesPartition, type ArticleReplyStore, type OutgoingArticleReply } from './ap/article-replies'
+import { wrapCreate } from './ap/outbox'
+import { deliverOne, type DeliverDeps, type DeliveryTransport } from './ap/deliver'
 import { safeSlug } from './pds/longform-routing'
 import type { IndexItem } from './pds/longform-index'
 import type { AtLongform } from './ap/translate'
@@ -704,6 +707,61 @@ export function makeInboundStore(ddb: Ddb, table: string): ApInboundStore {
   }
 }
 
+function makeArticleReplyStore(ddb: Ddb, table: string): ArticleReplyStore {
+  return {
+    async incoming(handle, id) {
+      const { Item } = await ddb.send(new GetCommand({
+        TableName: table, Key: incomingArticleReplyKey(handle, id), ConsistentRead: true,
+      }))
+      return Item as InboundRecord | undefined
+    },
+    async outgoing(handle, requestId) {
+      const { Item } = await ddb.send(new GetCommand({
+        TableName: table, Key: { pk: outgoingRepliesPartition(handle), sk: requestId }, ConsistentRead: true,
+      }))
+      return Item?.reply as OutgoingArticleReply | undefined
+    },
+    async putOutgoing(handle, reply) {
+      try {
+        await ddb.send(new PutCommand({
+          TableName: table, Item: { pk: outgoingRepliesPartition(handle), sk: reply.requestId, reply },
+          ConditionExpression: 'attribute_not_exists(sk)',
+        }))
+        return true
+      } catch (error) {
+        if (isCondFail(error)) return false
+        throw error
+      }
+    },
+  }
+}
+
+function makeBlueskyOnlyIndex(ddb: Ddb, table: string) {
+  return {
+    async has(did: string, rkey: string) {
+      const out = await ddb.send(new GetCommand({
+        TableName: table, Key: { pk: blueskyOnlyPartition(did), sk: rkey }, ConsistentRead: true,
+        ProjectionExpression: 'sk',
+      }))
+      return !!out.Item
+    },
+    async keys(did: string): Promise<string[]> {
+      const keys: string[] = []
+      let cursor: Record<string, unknown> | undefined
+      do {
+        const page = await ddb.send(new QueryCommand({
+          TableName: table, KeyConditionExpression: 'pk = :pk',
+          ExpressionAttributeValues: { ':pk': blueskyOnlyPartition(did) },
+          ConsistentRead: true, ProjectionExpression: 'sk', ExclusiveStartKey: cursor,
+        }))
+        for (const row of page.Items ?? []) keys.push(row.sk)
+        cursor = page.LastEvaluatedKey
+      } while (cursor)
+      return keys
+    },
+  }
+}
+
 /** DynamoDB document client rejects undefined map members unless told to remove them. */
 function stripDeep<T>(v: T): T {
   return JSON.parse(JSON.stringify(v))
@@ -805,9 +863,9 @@ export interface OutboxIndex {
   suppressedPostRkeys: Set<string>
 }
 
-export function outboxIndexFromItems(items: IndexItem[]): OutboxIndex {
+export function outboxIndexFromItems(items: IndexItem[], blueskyOnly: string[] = []): OutboxIndex {
   const slugByRkey = new Map<string, string>()
-  const suppressedPostRkeys = new Set<string>()
+  const suppressedPostRkeys = new Set(blueskyOnly)
   for (const it of items) {
     if (it.status !== 'published') continue
     slugByRkey.set(it.rkey, it.currentSlug)
@@ -1034,7 +1092,17 @@ export function makeRealDeps(): ApDeps {
   const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
     marshallOptions: { removeUndefinedValues: true },
   })
+  const inboundTable = process.env[AP_ENV.AP_INBOUND_TABLE]!
+  const blueskyOnly = makeBlueskyOnlyIndex(ddb, inboundTable)
+  const outboxIndex = async (did: string) => {
+    const [items, hidden] = await Promise.all([readIndexItems(did), blueskyOnly.keys(did)])
+    return outboxIndexFromItems(items, hidden)
+  }
   const getApKey = (handle: string) => getOrMintApKey(apKeyRef(handle), ssm)
+  const retryQueue = makeRetryQueue()
+  const transport: DeliveryTransport = {
+    ledger: makeDeliveryLedger(), retryQueue, followers: makeDeliverFollowersStore(), signRequest, postFetch: postFetchReal,
+  }
   const signActorLookup = ({ handle, origin }: { handle: string; origin: string }): SignRemoteGet =>
     async url => {
       const { privatePem } = await getApKey(handle)
@@ -1058,26 +1126,39 @@ export function makeRealDeps(): ApDeps {
         repoStorageFor(did),
         did,
         cursor,
-        outboxIndexFromItems(await readIndexItems(did)),
+        await outboxIndex(did),
       ),
     countOutbox: async (did) =>
       countOutboxFromStorage(
         repoStorageFor(did),
-        outboxIndexFromItems(await readIndexItems(did)),
+        await outboxIndex(did),
       ),
-    getOutboxPost: (did, rkey) =>
-      getOutboxPostFromStorage(repoStorageFor(did), did, rkey),
+    getOutboxPost: async (did, rkey) => (await blueskyOnly.has(did, rkey))
+      ? null : getOutboxPostFromStorage(repoStorageFor(did), did, rkey),
     getArticle: async (did, rkey) => {
       const item = await readIndexItem(did, rkey)
       if (!item || item.status !== 'published') return null
       const record = await loadLongformFromStorage(repoStorageFor(did), did, rkey)
       return record ? { record, slug: item.currentSlug } : null
     },
-    retryQueue: process.env[AP_ENV.AP_RETRY_QUEUE_URL] ? makeRetryQueue() : undefined,
+    retryQueue: process.env[AP_ENV.AP_RETRY_QUEUE_URL] ? retryQueue : undefined,
     customHosts: parseCustomHosts(process.env.AP_CUSTOM_HOSTS),
     getProfile: (did) => getProfileFromStorage(repoStorageFor(did), did),
     following: makeFollowingStore(ddb, process.env[AP_ENV.AP_FOLLOWING_TABLE]!),
-    inbound: makeInboundStore(ddb, process.env[AP_ENV.AP_INBOUND_TABLE]!),
+    inbound: makeInboundStore(ddb, inboundTable),
+    articleReplies: makeArticleReplyStore(ddb, inboundTable),
+    deliverArticleReply: async (handle, actor, reply) => {
+      const create = wrapCreate(actor, reply.note)
+      const key = `${create.id}|${reply.inbox}`
+      const completed = await transport.ledger.result?.(key)
+      if (completed) return completed
+      const { privatePem } = await getApKey(handle)
+      const outcome = await deliverOne({
+        handle, activityId: create.id, inbox: reply.inbox, actorIds: [],
+        body: Buffer.from(JSON.stringify({ '@context': 'https://www.w3.org/ns/activitystreams', ...create })),
+      }, { keyId: `${actor}#main-key`, privatePem }, transport, 'stream')
+      return outcome === 'duplicate' ? await transport.ledger.result?.(key) ?? outcome : outcome
+    },
     fetchJson: (url) => realFetchJson(url),
     fetchActorJson: (url, actor) => realFetchJson(url, defaultDnsLookupAll, signActorLookup(actor)),
     authenticateOwner: makeOwnerAuthenticator(tenantStore),
@@ -1092,7 +1173,6 @@ export function makeRealDeps(): ApDeps {
 // ap/deliver.ts must not import ../pds/storage or ../pds/repo-write directly.
 // ---------------------------------------------------------------------------
 
-import type { DeliverDeps } from './ap/deliver'
 import { resolveTenant } from './pds/tenant'
 
 /**
@@ -1144,6 +1224,7 @@ export async function loadPostRecordFromStorage(
     text: typeof v?.text === 'string' ? v.text : undefined,
     createdAt: typeof v?.createdAt === 'string' ? v.createdAt : undefined,
     facets: Array.isArray(v?.facets) ? v.facets : undefined,
+    reply: !!v?.reply,
     ...(typeof embedUri === 'string' ? { embed: { external: { uri: embedUri } } } : {}),
   }
 }
@@ -1284,14 +1365,21 @@ export function makeDeliveryLedger(): DeliverDeps['ledger'] {
         throw e
       }
     },
-    async complete(key) {
+    async result(key) {
+      const { Item } = await ddb.send(new GetCommand({
+        TableName: table, Key: { pk: pk(key) }, ConsistentRead: true, ProjectionExpression: '#outcome',
+        ExpressionAttributeNames: { '#outcome': 'outcome' },
+      }))
+      return Item?.outcome
+    },
+    async complete(key, outcome) {
       await ddb.send(
         new UpdateCommand({
           TableName: table,
           Key: { pk: pk(key) },
-          UpdateExpression: 'SET #s = :done, #t = :ttl',
-          ExpressionAttributeNames: { '#s': 'state', '#t': 'ttl' },
-          ExpressionAttributeValues: { ':done': 'done', ':ttl': nowSec() + LEDGER_TTL_SECONDS },
+          UpdateExpression: 'SET #s = :done, #t = :ttl, #outcome = :outcome',
+          ExpressionAttributeNames: { '#s': 'state', '#t': 'ttl', '#outcome': 'outcome' },
+          ExpressionAttributeValues: { ':done': 'done', ':ttl': nowSec() + LEDGER_TTL_SECONDS, ':outcome': outcome ?? null },
         }),
       )
     },
@@ -1303,7 +1391,10 @@ export function makeDeliveryLedger(): DeliverDeps['ledger'] {
 }
 
 export function makeDeliverDeps(): DeliverDeps {
+  const table = process.env[AP_ENV.AP_INBOUND_TABLE]
+  const blueskyOnly = table && makeBlueskyOnlyIndex(DynamoDBDocumentClient.from(new DynamoDBClient({})), table)
   return {
+    ...(blueskyOnly ? { isBlueskyOnly: blueskyOnly.has } : {}),
     resolveHandle: makeResolveHandle(),
     loadPostRecord: loadPostRecordReal,
     loadLongform: (did, rkey) =>

@@ -52,7 +52,9 @@ export type ArticleReply = {
   text: string;
   url: string;
   publishedAt: string;
+  handled?: boolean;
 };
+export type ReplySubmission = { status: "sent" | "queued"; url: string };
 export type ArticleReplies = { replies: ArticleReply[]; unavailable: ReplyNetwork[]; next?: string };
 
 export const SHARE_SOURCES = [
@@ -70,31 +72,41 @@ export class InsightsError extends Error {
 }
 
 export function createInsightsClient({ origin, token }: { origin: string; token: () => string | null | undefined | Promise<string | null | undefined> }) {
-  async function get<T>(path: string, query?: Record<string, string>): Promise<T> {
+  async function request<T>(path: string, query?: Record<string, string>, body?: object): Promise<T> {
     const session = await token();
     if (!session) throw new InsightsError(401, "Sign in to view article analytics.");
     const url = new URL(`/auth/insights${path}`, origin);
     url.search = new URLSearchParams(query).toString();
-    const response = await fetch(url, { headers: { Authorization: `Bearer ${session}` } });
+    const response = await fetch(url, {
+      method: body ? "POST" : "GET",
+      headers: { Authorization: `Bearer ${session}`, ...(body ? { "Content-Type": "application/json" } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
     if (response.status === 404 || !response.headers.get("content-type")?.includes("application/json")) {
       throw new InsightsError(response.status, response.ok || path === "" ? "Article analytics is unavailable on this deployment." : "This article is unavailable.");
     }
     const payload = await response.json() as T & { message?: string };
-    if (!response.ok) throw new InsightsError(response.status, payload.message ?? "Could not load analytics.");
+    if (!response.ok) throw new InsightsError(response.status, payload.message ?? (body ? "Could not update article replies." : "Could not load analytics."));
     return payload;
   }
   return {
-    sites: () => get<{ sites: InsightSite[] }>(""),
-    articles: (did: string, after?: string) => get<{ articles: InsightArticle[]; next?: string }>(
+    sites: () => request<{ sites: InsightSite[] }>(""),
+    articles: (did: string, after?: string) => request<{ articles: InsightArticle[]; next?: string }>(
       "/articles", { did, ...(after ? { after } : {}) },
     ),
-    replies: (did: string, rkey: string, after?: string) => get<ArticleReplies>(
+    replies: (did: string, rkey: string, after?: string) => request<ArticleReplies>(
       `/articles/${encodeURIComponent(rkey)}/replies`, { did, ...(after ? { after } : {}) },
     ),
-    distribution: (did: string, rkey: string) => get<ArticleDistribution>(
+    setReplyHandled: (did: string, rkey: string, target: Pick<ArticleReply, "network" | "id">, handled: boolean) =>
+      request<{ handled: boolean }>(`/articles/${encodeURIComponent(rkey)}/replies`, { did },
+        { action: "handled", id: target.id, network: target.network, handled }),
+    sendReply: (did: string, rkey: string, target: Pick<ArticleReply, "network" | "id">, text: string, requestId: string) =>
+      request<ReplySubmission>(`/articles/${encodeURIComponent(rkey)}/replies`, { did },
+        { action: "send", id: target.id, network: target.network, text, requestId }),
+    distribution: (did: string, rkey: string) => request<ArticleDistribution>(
       `/articles/${encodeURIComponent(rkey)}/distribution`, { did },
     ),
-    article: (did: string, rkey: string, days: InsightDays) => get<ArticleInsights>(
+    article: (did: string, rkey: string, days: InsightDays) => request<ArticleInsights>(
       `/articles/${encodeURIComponent(rkey)}`, { did, days: String(days) },
     ),
   };

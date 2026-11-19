@@ -84,6 +84,8 @@ assert.ok(require.resolve("@martzmakes/serverless-social/insights-web"));
 for (const route of ["/auth/insights", "/auth/insights/articles", "/auth/insights/articles/{rkey}", "/auth/insights/articles/{rkey}/distribution", "/auth/insights/articles/{rkey}/replies"]) {
   assert.ok(resources("Standalone", "AWS::ApiGatewayV2::Route").some(item => item.RouteKey === `GET ${route}`));
 }
+assert.ok(resources("Standalone", "AWS::ApiGatewayV2::Route").some(item =>
+  item.RouteKey === "POST /auth/insights/articles/{rkey}/replies"));
 const existingOrigin = originFor(distribution("ExistingFirehose"), stream);
 assert.equal(existingOrigin.DomainName, "firehose.example.com");
 assert.deepEqual(existingOrigin.OriginCustomHeaders, [

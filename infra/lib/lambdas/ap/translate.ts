@@ -141,7 +141,7 @@ export const ARTICLE_HTML_MAX_BYTES = 60_000
  * Escape the four mandatory HTML characters for use in text content nodes.
  * Handles < > & and " (covers attribute values too, conservatively).
  */
-function escapeHtml(s: string): string {
+export function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')   // must come first to avoid double-escaping
     .replace(/</g, '&lt;')

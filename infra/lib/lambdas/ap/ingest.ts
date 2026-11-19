@@ -203,6 +203,7 @@ export async function ingestArticleReply(type: string, activity: any, c: {
   followee: FollowingRow | null
   store: ApInboundStore
   hasArticle: (rkey: string) => Promise<boolean>
+  resolveParentArticle?: (parentId: string) => Promise<string | undefined>
   now?: () => number
 }): Promise<IngestOutcome> {
   const partition = articleRepliesPartition(c.handle);
@@ -219,7 +220,9 @@ export async function ingestArticleReply(type: string, activity: any, c: {
   // change or a deleted note must also disappear from the author's inbox.
   const parent = singleId(obj.inReplyTo);
   const prefix = `${c.origin}/ap/users/${c.handle}/articles/`;
-  const rkey = parent?.startsWith(prefix) ? parent.slice(prefix.length) : '';
+  const rkey = parent?.startsWith(prefix)
+    ? parent.slice(prefix.length)
+    : parent && c.resolveParentArticle ? await c.resolveParentArticle(parent) ?? '' : '';
   const validParent = /^(?!\.{1,2}$)[a-zA-Z0-9._~:-]{1,512}$/.test(rkey);
   if (!validParent || !isVisible(audience(obj, activity), undefined, false)) {
     return type === 'Update' && await c.store.remove(partition, key, c.signerId) ? 'deleted' : 'ignored';

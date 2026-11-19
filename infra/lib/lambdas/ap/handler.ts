@@ -59,6 +59,7 @@ import {
   FIRST_RETRY_DELAY_SECONDS,
   isRetryableStatus,
   type RetryQueue,
+  type DeliveryOutcome,
 } from './deliver'
 // Real AWS/network-backed deps live OUTSIDE ap/** (cardinal-rule guard).
 // M2: the handler<->ap-deps cycle is INTENTIONAL and effect-free at module
@@ -88,6 +89,11 @@ import {
   ingestArticleReply,
   type ApInboundStore,
 } from './ingest'
+import {
+  articleRecordKey, isCurrentArticleReply, makeArticleReply, replyContentDigest, replyRequestId, validReplyText,
+  type ArticleReplyStore, type OutgoingArticleReply,
+} from './article-replies'
+import { safeHttpsUrl } from './sanitize'
 
 // ---------------------------------------------------------------------------
 // AP-owned env keys (Task 9 wires the tables; ap-deps.ts reads them).
@@ -218,6 +224,8 @@ export interface ApDeps {
   following?: ApFollowingStore
   /** Ingested posts from accepted followees. */
   inbound?: ApInboundStore
+  articleReplies?: ArticleReplyStore
+  deliverArticleReply?(handle: string, actor: string, reply: OutgoingArticleReply): Promise<DeliveryOutcome>
   /**
    * GET returning parsed JSON behind assertSafeRemoteUrl (https only, every
    * redirect hop re-guarded, size capped, timeout). Used for webfinger, actor
@@ -650,6 +658,13 @@ async function handleInbox(
     const reply = deps.getArticle && await ingestArticleReply(type, activity, {
       handle, origin, signerId: actorId, followee, store: deps.inbound,
       hasArticle: async rkey => !!await deps.getArticle!(did, rkey),
+      resolveParentArticle: async parentId => {
+        const prefix = `${ourActorId}/replies/`
+        if (!parentId.startsWith(prefix)) return
+        const requestId = parentId.slice(prefix.length)
+        if (!replyRequestId.test(requestId)) return
+        return (await deps.articleReplies?.outgoing(handle, requestId))?.articleRkey
+      },
     });
     const outcome = await ingestActivity(type, activity, {
       handle,
@@ -844,8 +859,8 @@ async function isOwner(req: ApRequest, tenant: Tenant | null, deps: ApDeps): Pro
   }
 }
 
-function parseOwnerBody(req: ApRequest): { value: any } | { error: ApResult } {
-  if (req.rawBody.length > OWNER_MAX_BODY_BYTES) {
+function parseOwnerBody(req: ApRequest, maxBytes = OWNER_MAX_BODY_BYTES): { value: any } | { error: ApResult } {
+  if (req.rawBody.length > maxBytes) {
     return { error: err(413, 'PayloadTooLarge', 'Request body too large') }
   }
   try {
@@ -855,6 +870,53 @@ function parseOwnerBody(req: ApRequest): { value: any } | { error: ApResult } {
   } catch {
     return { error: err(400, 'BadRequest', 'Body must be a JSON object') }
   }
+}
+
+async function sendArticleReply(req: ApRequest, tenant: Tenant, origin: string, deps: ApDeps): Promise<ApResult> {
+  if (!deps.articleReplies || !deps.deliverArticleReply || !deps.getArticle) {
+    return err(501, 'NotImplemented', 'Article replies are unavailable')
+  }
+  const parsed = parseOwnerBody(req, 7000)
+  if ('error' in parsed) return parsed.error
+  const { articleRkey, parentId, requestId, text } = parsed.value
+  if (typeof articleRkey !== 'string' || !articleRecordKey.test(articleRkey) ||
+      typeof requestId !== 'string' || !replyRequestId.test(requestId) ||
+      typeof parentId !== 'string' || !safeHttpsUrl(parentId) || !validReplyText(text)) {
+    return err(400, 'BadRequest', 'Choose an article reply and enter up to 300 characters')
+  }
+  const { handle, did } = tenant
+  const actor = `${origin}/ap/users/${handle}`
+  const message = text.trim()
+  const fingerprint = replyContentDigest('Fediverse', articleRkey, parentId, message)
+  let reply = await deps.articleReplies.outgoing(handle, requestId)
+  if (!reply) {
+    const parent = await deps.articleReplies.incoming(handle, parentId)
+    if (!isCurrentArticleReply(parent, articleRkey, parentId) || !await deps.getArticle(did, articleRkey)) {
+      return err(422, 'Unavailable', 'That reply is unavailable for this article')
+    }
+    let remote: RemoteActor
+    try {
+      remote = await deps.fetchRemoteActor(parent.owner, { handle, origin })
+    } catch {
+      return err(422, 'Unavailable', 'The remote actor could not be reached')
+    }
+    if (remote.id !== parent.owner || !safeHttpsUrl(remote.inbox)) {
+      return err(422, 'Unavailable', 'The remote actor could not be verified')
+    }
+    const proposed = makeArticleReply(actor, requestId, articleRkey, parent, remote.inbox, message)
+    reply = await deps.articleReplies.putOutgoing(handle, proposed)
+      ? proposed
+      : await deps.articleReplies.outgoing(handle, requestId)
+  }
+  if (reply?.fingerprint !== fingerprint) return err(409, 'Conflict', 'This reply request has already been used')
+
+  const outcome = await deps.deliverArticleReply(handle, actor, reply)
+  if (outcome === 'gone' || outcome === 'rejected') {
+    return err(422, 'Rejected', 'The remote server did not accept the reply')
+  }
+  const status = outcome === 'delivered' ? 'sent' : 'queued'
+  const result = json(status === 'sent' ? 200 : 202, { url: reply.note.id, status }, 'application/json')
+  return { ...result, headers: { 'cache-control': 'private, no-store' } }
 }
 
 async function handleOwnerRoute(
@@ -1041,6 +1103,12 @@ export async function dispatch(
         return await handleOwnerRoute(handle, sub, req, deps)
       }
 
+      if (sub === '/replies' && method === 'POST') {
+        const tenant = await resolveHandleTenant(handle, deps.tenantStore)
+        if (!tenant || !await isOwner(req, tenant, deps)) return unauthorized()
+        return await sendArticleReply(req, tenant, canonicalApOrigin(tenant.handle, deps.customHosts ?? []), deps)
+      }
+
       // POST .../inbox — signed Follow/Undo
       if (method === 'POST' && sub === '/inbox') {
         const tenant = await resolveHandleTenant(handle, deps.tenantStore)
@@ -1061,6 +1129,13 @@ export async function dispatch(
       // host (old serverless.social URL or custom domain) the request used.
       const customHosts = deps.customHosts ?? []
       const origin = canonicalApOrigin(tenant.handle, customHosts)
+
+      const replyObject = /^\/replies\/([^/]+)$/.exec(sub)?.[1]
+      if (replyObject && replyRequestId.test(replyObject)) {
+        const reply = await deps.articleReplies?.outgoing(tenant.handle, replyObject)
+        if (!reply) return err(404, 'NotFound', 'No such reply')
+        return json(200, { '@context': 'https://www.w3.org/ns/activitystreams', ...reply.note }, AS)
+      }
 
       // GET /ap/users/<h> — the actor (content-negotiated)
       if (sub === '') {

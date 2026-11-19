@@ -1,7 +1,8 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import {
   DEVICES, SHARE_SOURCES, SOURCES, taggedArticleUrl,
-  type ArticleDistribution, type ArticleInsights, type ArticleReplies, type InsightArticle, type InsightDays, type InsightSite, type InsightsClient,
+  type ArticleDistribution, type ArticleInsights, type ArticleReplies, type ArticleReply,
+  type InsightArticle, type InsightDays, type InsightSite, type InsightsClient, type ReplySubmission,
 } from "./insights";
 
 const number = new Intl.NumberFormat();
@@ -35,6 +36,7 @@ export function PostInsights({ client, preferredHost, accent = "#4476e7" }: {
     }).catch(reason => { if (active) setError(message(reason)); });
     return () => { active = false; };
   }, [client, preferredHost, attempt]);
+  const selectedSite = sites?.find(site => site.did === did);
   return (
     <section aria-label="Post control room" style={{ maxWidth: 880, margin: "auto", padding: "clamp(1rem, 4vw, 2rem)", fontFamily: "system-ui", overflowWrap: "anywhere" }}>
       <h1 style={{ marginTop: 0 }}>Post control room</h1>
@@ -49,14 +51,15 @@ export function PostInsights({ client, preferredHost, accent = "#4476e7" }: {
               {sites.map(site => <option key={site.did} value={site.did}>{site.host}</option>)}
             </select>
           </label>
-          {did && <SiteArticles key={did} client={client} did={did} accent={accent} />}
+          {selectedSite && <SiteArticles key={did} client={client} site={selectedSite} accent={accent} />}
         </>
       )}
     </section>
   );
 }
 
-function SiteArticles({ client, did, accent }: { client: InsightsClient; did: string; accent: string }) {
+function SiteArticles({ client, site, accent }: { client: InsightsClient; site: InsightSite; accent: string }) {
+  const { did } = site;
   const [articles, setArticles] = useState<InsightArticle[]>([]);
   const [rkey, setRkey] = useState("");
   const [days, setDays] = useState<InsightDays>(30);
@@ -79,6 +82,7 @@ function SiteArticles({ client, did, accent }: { client: InsightsClient; did: st
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [client, did, after, attempt]);
+  const selectedArticle = articles.find(article => article.rkey === rkey);
 
   return (
     <>
@@ -98,7 +102,20 @@ function SiteArticles({ client, did, accent }: { client: InsightsClient; did: st
       {error && <p role="alert">{error} <button onClick={() => setAttempt(n => n + 1)}>Retry</button></p>}
       {next && !error && <p><button disabled={loading} onClick={() => setAfter(next)}>Load more articles</button></p>}
       {!rkey && !next && !loading && !error && <p>Publish an article to start seeing its analytics here.</p>}
-      {rkey && <Report key={`${rkey}:${days}`} client={client} did={did} rkey={rkey} days={days} accent={accent} />}
+      {selectedArticle && (
+        <div key={rkey}>
+          <div style={{ marginBlock: "1.5rem" }}>
+            <h2 style={{ marginBottom: ".5rem" }}>{selectedArticle.title}</h2>
+            <div style={layout}>
+              <a href={selectedArticle.url}>Open article</a>
+              {selectedArticle.blueskyUrl && <a href={selectedArticle.blueskyUrl}>Open Bluesky post</a>}
+            </div>
+          </div>
+          <ArticleConversation client={client} site={site} rkey={rkey} />
+          <Distribution client={client} did={did} article={selectedArticle} />
+          <Report key={days} client={client} did={did} rkey={rkey} days={days} accent={accent} />
+        </div>
+      )}
     </>
   );
 }
@@ -126,15 +143,6 @@ function Report({ client, did, rkey, days, accent }: {
     (Object.keys(labels) as T[]).flatMap(key => values[key] ? [{ label: labels[key], views: values[key]! }] : []);
   return (
     <>
-      <div style={{ marginBlock: "1.5rem" }}>
-        <h2 style={{ marginBottom: ".5rem" }}>{report.article.title}</h2>
-        <div style={layout}>
-          <a href={report.article.url}>Open article</a>
-          {report.article.blueskyUrl && <a href={report.article.blueskyUrl}>Open Bluesky post</a>}
-        </div>
-      </div>
-      <Distribution key={rkey} client={client} did={did} article={report.article} />
-      <ArticleConversation client={client} did={did} rkey={rkey} />
       <section style={border} aria-label="Page views by day">
         <h3 style={{ marginTop: 0 }}><strong style={{ fontSize: "1.65rem" }}>{number.format(report.views)}</strong> page views</h3>
         <div aria-hidden="true" style={{ display: "flex", height: "6rem", gap: 2, alignItems: "end", borderBottom: "1px solid currentColor" }}>
@@ -209,10 +217,17 @@ function Distribution({ client, did, article }: { client: InsightsClient; did: s
   );
 }
 
-function ArticleConversation({ client, did, rkey }: { client: InsightsClient; did: string; rkey: string }) {
+function replyKey(reply: ArticleReply) {
+  return `${reply.network}:${reply.id}`;
+}
+
+function ArticleConversation({ client, site, rkey }: { client: InsightsClient; site: InsightSite; rkey: string }) {
+  const { did } = site;
   const [data, setData] = useState<ArticleReplies>();
   const [after, setAfter] = useState<string>();
   const [open, setOpen] = useState(false);
+  const [showHandled, setShowHandled] = useState(false);
+  const [composing, setComposing] = useState<string>();
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
@@ -226,8 +241,8 @@ function ArticleConversation({ client, did, rkey }: { client: InsightsClient; di
       if (!active) return;
       setData(previous => {
         if (!after) return page;
-        const replies = new Map(previous?.replies.map(reply => [`${reply.network}:${reply.id}`, reply]));
-        for (const reply of page.replies) replies.set(`${reply.network}:${reply.id}`, reply);
+        const replies = new Map(previous?.replies.map(reply => [replyKey(reply), reply]));
+        for (const reply of page.replies) replies.set(replyKey(reply), reply);
         return {
           ...page,
           replies: [...replies.values()].sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt)),
@@ -240,32 +255,123 @@ function ArticleConversation({ client, did, rkey }: { client: InsightsClient; di
     return () => { active = false; };
   }, [client, did, rkey, after, open, attempt]);
 
+  function setHandled(reply: ArticleReply, handled: boolean) {
+    setData(previous => previous && {
+      ...previous,
+      replies: previous.replies.map(item => replyKey(item) === replyKey(reply) ? { ...item, handled } : item),
+    });
+  }
+
+  const visible = data?.replies.filter(reply => Boolean(reply.handled) === showHandled) ?? [];
+
   return (
     <details style={{ ...border, marginBottom: "1.25rem" }} onToggle={event => {
       if (event.currentTarget.open) setOpen(true);
     }}>
       <summary>Article replies</summary>
+      {data && (
+        <div style={{ ...layout, marginBlock: ".75rem" }} role="group" aria-label="Reply status">
+          <button type="button" aria-pressed={!showHandled} onClick={() => { setShowHandled(false); setComposing(undefined); }}>Open</button>
+          <button type="button" aria-pressed={showHandled} onClick={() => { setShowHandled(true); setComposing(undefined); }}>Handled</button>
+          <button type="button" disabled={loading} onClick={() => { setAfter(undefined); setAttempt(value => value + 1); }}>Refresh replies</button>
+        </div>
+      )}
       {loading && <p role="status">Loading replies…</p>}
       {(failed || !!data?.unavailable.length) && (
         <p role="alert">
-          {failed ? "Couldn't load replies." : `Couldn't load replies from ${data?.unavailable.join(" and ")}.`}{" "}
-          <button disabled={loading} onClick={() => { setAfter(undefined); setAttempt(value => value + 1); }}>Refresh replies</button>
+          {failed ? "Couldn't load replies." : `Couldn't load replies from ${data?.unavailable.join(" and ")}.`}{' '}
+          {!data && <button type="button" disabled={loading} onClick={() => setAttempt(value => value + 1)}>Retry</button>}
         </p>
       )}
-      {!!data?.replies.length && (
+      {!!visible.length && (
         <ul style={{ paddingLeft: "1rem" }}>
-          {data.replies.map(reply => (
-            <li key={`${reply.network}:${reply.id}`} style={{ marginBlock: "1rem" }}>
-              <strong>{reply.author}</strong> · <span>{reply.network}</span>
-              <p style={{ whiteSpace: "pre-wrap", marginBlock: ".35rem" }}>{reply.text}</p>
-              <a href={reply.url}>Open reply on {reply.network}</a>
-            </li>
+          {visible.map(reply => (
+            <ReplyItem key={replyKey(reply)} reply={reply} site={site} client={client} rkey={rkey}
+              composing={composing === replyKey(reply)} onCompose={active => setComposing(active ? replyKey(reply) : undefined)}
+              onHandled={handled => setHandled(reply, handled)} />
           ))}
         </ul>
       )}
-      {data && !data.replies.length && !data.unavailable.length && !loading && !failed && <p>No replies are available for this article.</p>}
-      {data?.next && !failed && <button disabled={loading} onClick={() => setAfter(data.next)}>Load older Fediverse replies</button>}
+      {data && !visible.length && !data.unavailable.length && !loading && !failed &&
+        <p>{showHandled ? "No handled replies to display." : "No open replies to display."}</p>}
+      {data?.next && !failed && <button type="button" disabled={loading} onClick={() => setAfter(data.next)}>Load older Fediverse replies</button>}
     </details>
+  );
+}
+
+function ReplyItem({ reply, site, client, rkey, composing, onCompose, onHandled }: {
+  reply: ArticleReply; site: InsightSite; client: InsightsClient; rkey: string; composing: boolean;
+  onCompose: (active: boolean) => void; onHandled: (handled: boolean) => void;
+}) {
+  const [text, setText] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState("");
+  const [receipt, setReceipt] = useState<ReplySubmission>();
+  const submission = useRef<{ text: string; id: string }>(undefined);
+
+  async function send(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const normalized = text.trim();
+    if (!normalized || pending) return;
+    setPending(true);
+    setError("");
+    try {
+      const intent = submission.current?.text === normalized ? submission.current : { text: normalized, id: crypto.randomUUID() };
+      submission.current = intent;
+      const result = await client.sendReply(site.did, rkey, reply, intent.text, intent.id);
+      setReceipt(result);
+      setText("");
+      submission.current = undefined;
+      onCompose(false);
+    } catch (reason) {
+      setError(message(reason));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function changeStatus() {
+    if (pending) return;
+    setPending(true);
+    setError("");
+    try {
+      const result = await client.setReplyHandled(site.did, rkey, reply, !reply.handled);
+      onHandled(result.handled);
+    } catch (reason) {
+      setError(message(reason));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <li style={{ marginBlock: "1rem" }}>
+      <strong>{reply.author}</strong> · <span>{reply.network}</span>
+      <p style={{ whiteSpace: "pre-wrap", marginBlock: ".35rem" }}>{reply.text}</p>
+      <div style={layout}>
+        <a href={reply.url}>Open reply on {reply.network}</a>
+        {!composing && <button type="button" disabled={pending} onClick={() => { setError(""); onCompose(true); }}>Reply</button>}
+        <button type="button" disabled={pending} onClick={() => void changeStatus()}>{reply.handled ? "Reopen" : "Mark handled"}</button>
+      </div>
+      {composing && (
+        <form onSubmit={send} style={{ marginBlock: ".75rem" }}>
+          <label style={field}>Reply as @{site.handle} on {reply.network}
+            <textarea rows={3} style={{ ...control, resize: "vertical" }} value={text} maxLength={3000}
+              onChange={event => setText(event.target.value)} disabled={pending} />
+          </label>
+          <small>Up to 300 characters.</small>
+          <div style={{ ...layout, marginBlock: ".5rem" }}>
+            <button type="submit" disabled={pending || !text.trim()}>{pending ? "Sending…" : "Send public reply"}</button>
+            <button type="button" disabled={pending} onClick={() => { setError(""); onCompose(false); }}>Cancel</button>
+          </div>
+        </form>
+      )}
+      {error && <p role="alert">{error}</p>}
+      {receipt && <p role="status">
+        {receipt.status === "queued" ? "Queued for delivery." : "Reply sent."}{' '}
+        <a href={receipt.url}>Open your reply</a>
+      </p>}
+    </li>
   );
 }
 
