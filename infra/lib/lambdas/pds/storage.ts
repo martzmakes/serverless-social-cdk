@@ -65,12 +65,16 @@ export class DynamoRepoStorage extends ReadableBlockstore implements RepoStorage
     return CID.parse(res.Item.headCid as string) as Cid
   }
 
-  async updateRoot(cid: Cid, rev: string): Promise<void> {
+  async updateRoot(cid: Cid, rev: string, expectedRoot?: Cid): Promise<void> {
     const { pk, sk } = keyFor(this.did, 'root')
     await this.doc.send(
       new PutCommand({
         TableName: this.table,
         Item: { pk, sk, headCid: cid.toString(), rev },
+        ...(expectedRoot ? {
+          ConditionExpression: "headCid = :previous",
+          ExpressionAttributeValues: { ":previous": expectedRoot.toString() },
+        } : {}),
       }),
     )
   }
@@ -225,12 +229,12 @@ export class DynamoRepoStorage extends ReadableBlockstore implements RepoStorage
 
   /**
    * applyCommit is the write path called by Repo.applyCommit / Repo.applyWrites.
-   * Strategy: write newBlocks first, then update the root pointer.  Non-transactional
-   * but safe for single-writer: a crash leaves orphaned blocks, never a dangling root.
+   * Write new blocks first, then update the root only if the previous commit is current.
+   * A crash or a competing commit can leave orphaned blocks, never a dangling root.
    * removedCids GC is deferred (single low-volume repo — see docs/research/01-atproto-pds.md §7).
    */
   async applyCommit(commit: CommitData): Promise<void> {
     await this.putMany(commit.newBlocks, commit.rev)
-    await this.updateRoot(commit.cid, commit.rev)
+    await this.updateRoot(commit.cid, commit.rev, commit.prev ?? undefined)
   }
 }

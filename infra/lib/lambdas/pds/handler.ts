@@ -108,6 +108,7 @@ async function getJwtSecret(): Promise<Uint8Array> {
 function xrpcErrorStatus(code: string): number {
   switch (code) {
     case 'InvalidRequest':  return 400
+    case 'InvalidSwap':     return 409
     case 'AuthRequired':    return 401
     // 400, not 404 — see the file-level doc comment: this keeps XRPC
     // "not found" errors off the HTTP status CloudFront's SPA-fallback
@@ -501,6 +502,7 @@ export async function route(
           collection: body?.collection,
           rkey: body?.rkey,
           record: body?.record,
+          swapRecord: body?.swapRecord,
         })
         return jsonOk(result)
       }
@@ -792,6 +794,9 @@ export async function route(
         err.xrpcError,
         err.message,
       )
+    }
+    if (err?.name === 'ConditionalCheckFailedException') {
+      return jsonErr(409, 'InvalidSwap', 'The repository changed before the write. Retry with the latest record.')
     }
     // Generic errors — log server-side for diagnosability (CloudWatch only;
     // never leaked to the client) then return an opaque 500.

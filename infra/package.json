@@ -1,6 +1,6 @@
 {
   "name": "@martzmakes/serverless-social",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "AWS CDK constructs for an AT Protocol PDS, shared firehose, and static sites",
   "repository": {
     "type": "git",
@@ -28,16 +28,19 @@
     "@aws-sdk/client-cloudfront-keyvaluestore": "^3.1048.0",
     "@aws-sdk/client-dynamodb": "^3.1048.0",
     "@aws-sdk/client-s3": "^3.1048.0",
+    "@aws-sdk/client-scheduler": "3.1048.0",
     "@aws-sdk/client-sesv2": "^3.1024.0",
     "@aws-sdk/client-sqs": "^3.1048.0",
     "@aws-sdk/client-ssm": "^3.1024.0",
     "@aws-sdk/lib-dynamodb": "^3.1048.0",
+    "@aws-sdk/s3-request-presigner": "3.1048.0",
     "@aws-sdk/signature-v4a": "^3.1048.0",
     "@types/aws-lambda": "^8.10.161",
     "@types/jest": "^30",
     "@types/jsdom": "^21.1.7",
     "@types/node": "^24.10.1",
     "@types/qrcode": "^1.5.6",
+    "@types/react": "19.1.17",
     "aws-cdk": "2.1117.0",
     "aws-cdk-lib": "^2.247.0",
     "constructs": "^10.5.0",
@@ -50,6 +53,7 @@
     "marked": "18.1.2",
     "parse5": "7.3.0",
     "qrcode": "^1.5.4",
+    "react": "19.1.0",
     "stripe": "^22.0.1",
     "ts-jest": "^29",
     "ts-node": "^10.9.2",
@@ -63,6 +67,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./editor": {
+      "types": "./dist/editor.d.ts",
+      "default": "./dist/editor.js"
+    },
+    "./editor-web": {
+      "types": "./dist/editor-web.d.ts",
+      "default": "./dist/editor-web.js"
     }
   },
   "files": [
@@ -73,10 +85,16 @@
   },
   "peerDependencies": {
     "aws-cdk-lib": "^2.247.0",
-    "constructs": "^10.5.0"
+    "constructs": "^10.5.0",
+    "react": ">=18 <20"
   },
   "bin": {
     "serverless-social-bootstrap": "./dist/pds-bootstrap.cjs"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  }
 }

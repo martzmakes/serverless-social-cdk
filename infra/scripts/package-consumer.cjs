@@ -29,6 +29,10 @@ new ServerlessSocialStack(app, "ExistingFirehose", {
   ...props,
   firehose: { mode: "existing", hostname: "firehose.example.com", instanceId: "example-repo" },
 });
+new ServerlessSocialStack(app, "Editor", {
+  ...props, editor: true,
+  firehose: { mode: "existing", hostname: "firehose.example.com", instanceId: "editor-test" },
+});
 const site = new Stack(app, "ExistingPds", { env });
 new ServerlessSocialSite(site, "Site", {
   domain: "example.net",
@@ -67,6 +71,14 @@ assert.ok(fs.existsSync(path.join(firehoseAsset, "npm-shrinkwrap.json")));
 assert.ok(fs.existsSync(path.join(firehoseAsset, "dist", "server.bundle.cjs")));
 assert.ok(resources("Standalone", "AWS::Lambda::Function").filter(fn => fn.Handler === "index.handler").length >= 16);
 assert.equal(resources("ExistingFirehose", "AWS::EC2::Instance").length, 0);
+const editorTargets = resources("Editor", "AWS::ApiGatewayV2::Route").map(route => route.RouteKey);
+assert.ok(editorTargets.includes("GET /auth/editor"));
+assert.ok(editorTargets.includes("PUT /auth/editor/{proxy+}"));
+assert.equal(resources("Editor", "AWS::Scheduler::ScheduleGroup").length, 1);
+assert.equal(resources("Editor", "AWS::EC2::Instance").length, 0);
+assert.equal(resources("Standalone", "AWS::Scheduler::ScheduleGroup").length, 0);
+assert.ok(require("@martzmakes/serverless-social/editor").createEditorClient);
+assert.ok(require.resolve("@martzmakes/serverless-social/editor-web"));
 const existingOrigin = originFor(distribution("ExistingFirehose"), stream);
 assert.equal(existingOrigin.DomainName, "firehose.example.com");
 assert.deepEqual(existingOrigin.OriginCustomHeaders, [

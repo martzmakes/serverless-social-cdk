@@ -35,6 +35,7 @@ import { lambdaSource } from "./lambda-assets";
 import { LongformIndexTable } from "./longform-index-table";
 import { PostAnalyticsTable } from "./post-analytics-table";
 import { TenantsTable } from "./tenants-table";
+import { PostEditor } from "./post-editor";
 
 export type FirehoseConfiguration =
   | {
@@ -70,6 +71,8 @@ export interface ServerlessSocialStackProps extends cdk.StackProps {
   };
   /** Preserve the historical handle override for existing installations. */
   readonly pdsHandle?: string;
+  /** Add a private draft editor and scheduled publishing to the shared PDS. */
+  readonly editor?: boolean;
 }
 
 export class InfraStack extends cdk.Stack {
@@ -306,6 +309,7 @@ export class InfraStack extends cdk.Stack {
         allowMethods: [
           apigwv2.CorsHttpMethod.GET,
           apigwv2.CorsHttpMethod.POST,
+          ...(props.editor ? [apigwv2.CorsHttpMethod.PUT] : []),
           apigwv2.CorsHttpMethod.DELETE,
           apigwv2.CorsHttpMethod.OPTIONS,
         ],
@@ -325,6 +329,22 @@ export class InfraStack extends cdk.Stack {
         ALLOWED_EMAILS: allowedEmails,
       },
     };
+
+    if (props.editor) {
+      new PostEditor(this, "PostEditor", {
+        api: authHttpApi,
+        tenants: tenantsTable.table,
+        jwtSecret: jwtSecretParam,
+        environment: {
+          DOMAIN,
+          PROJECT_SLUG,
+          PDS_HANDLE: pdsHandle,
+          JWT_SECRET_NAME,
+          ALLOWED_EMAILS: allowedEmails,
+          KNOWN_TENANT_HOSTS,
+        },
+      });
+    }
 
     const requestMagicLinkHandler = new lambda.NodejsFunction(
       this,

@@ -21,7 +21,7 @@ import type { LexMap } from '@atproto/lex-data'
 import { loadRepoOrThrow } from './repo-root'
 import { DynamoRepoStorage } from './storage'
 import { sequenceCommit, type SeqOpAction } from './sequencer'
-import { normalizeCidsToIpldJson } from './lex-json'
+import { normalizeCidsToIpldJson, restoreIpldLinks } from './lex-json'
 
 /**
  * Append a relay-verifiable #commit event to the firehose log after a write.
@@ -219,6 +219,7 @@ export type PutRecordInput = {
   collection: string
   rkey: string
   record: Record<string, unknown>
+  swapRecord?: string | null
 }
 
 export type DeleteRecordInput = {
@@ -293,10 +294,8 @@ export async function createRecord(
 /**
  * Upsert a record at the given rkey.
  *
- * Strategy: attempt Update first; if the record does not exist (the MST has no
- * entry for that key) the Update will fail with an error — catch it and retry
- * with Create.  This keeps the caller API clean: callers don't need to know
- * whether the record already exists.
+ * With swapRecord, require the expected record CID (or null for creation).
+ * Conditional writes also compare the root before installing the new commit.
  */
 export async function putRecord(
   storage: RepoStorage,
@@ -304,24 +303,21 @@ export async function putRecord(
   did: string,
   input: PutRecordInput,
 ): Promise<WriteResult> {
+  if (input.swapRecord === null) await ensureRepoRoot(storage, did, keypair)
   const repo = await Repo.load(storage)
-
-  // Single-tenant PDS: exactly one writer, no concurrent putRecord — the check-then-write gap is safe by deployment assumption (see docs/research/01 §6).
-  // Check whether the record already exists so we can pick the right action.
-  const existing = await repo.getRecord(input.collection, input.rkey)
-  const action = existing !== null ? WriteOpAction.Update : WriteOpAction.Create
-
-  const next = await repo.applyWrites(
-    [
-      {
-        action,
-        collection: input.collection as NsidString,
-        rkey: input.rkey,
-        record: input.record as LexMap,
-      },
-    ],
-    keypair,
-  )
+  const oldCid = await repo.data.get(`${input.collection}/${input.rkey}`)
+  const invalidSwap = () => Object.assign(new Error('The record changed before the update'), { xrpcError: 'InvalidSwap' })
+  if (input.swapRecord !== undefined && (oldCid?.toString() ?? null) !== input.swapRecord) {
+    throw invalidSwap()
+  }
+  const action = oldCid ? WriteOpAction.Update : WriteOpAction.Create
+  const writes = [{
+    action,
+    collection: input.collection as NsidString,
+    rkey: input.rkey,
+    record: (input.swapRecord === undefined ? input.record : restoreIpldLinks(input.record)) as LexMap,
+  }]
+  const next = await repo.applyWrites(writes, keypair)
   await sequenceAfterWrite(
     storage,
     did,

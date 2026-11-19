@@ -41,3 +41,13 @@ export function normalizeCidsToIpldJson<T>(value: T): T {
   // Primitives + null
   return value
 }
+
+/** Restore wire-format IPLD links before hashing editor records into the signed repo. */
+export function restoreIpldLinks(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(restoreIpldLinks)
+  if (!isObject(value)) return value
+  if (Object.keys(value).length === 1 && typeof value.$link === 'string') {
+    return CID.parse(value.$link)
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, restoreIpldLinks(item)]))
+}

@@ -8,6 +8,8 @@ export const lambdaEntries = [
   "auth/verify",
   "auth/me",
   "auth/pds-session",
+  "editor/handler",
+  "editor/worker",
   "oauth/handler",
   "mcp/server",
   "atproto-oauth/handler",

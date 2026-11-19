@@ -89,6 +89,30 @@ This construct deploys a static bundle and forwards app routes to the PDS. For a
 
 For staging, set `notifyOfUpdateTargets: []` on the PDS stack to suppress relay notifications while testing commits on its firehose.
 
+## Add the web post editor
+
+Set `editor: true` on `ServerlessSocialStack`. Sites attached to that backend use the same editor API, and each signed-in author can access drafts for the DIDs their session is entitled to edit. A site connected to an existing PDS can use the editor when the backend operator enables it.
+
+The package exports the browser client and an optional React editor without loading the CDK in the browser:
+
+```tsx
+import { createEditorClient } from "@martzmakes/serverless-social/editor";
+import { PostEditor } from "@martzmakes/serverless-social/editor-web";
+
+// Create the client once per active identity.
+const client = createEditorClient({
+  origin: window.location.origin,
+  did: activeDid,
+  token: getStoredAppJwt,
+});
+
+<PostEditor client={client} identity={activeHandle} />;
+```
+
+The editor supports short posts and longform articles, autosave, image uploads, revocable unlisted previews, and revisions of published posts. The client uses the deployment's existing application JWT. Drafts and original uploads live in DynamoDB and private S3. Publishing promotes attached images and writes to the PDS, where the usual rendering and federation run. A revision leaves the currently published record visible until the revision is published. Recipients can save anything they can open via an unlisted preview link.
+
+Scheduling uses one-time EventBridge Scheduler jobs and an SQS-triggered publisher. Scheduled times are stored in UTC. Scheduler delivers within the selected minute and publication follows queue processing. Canceled or replaced jobs are ignored when delivered. The draft table and media bucket are retained after stack deletion. Monitor the editor dead-letter queue for exhausted deliveries.
+
 ## Package verification
 
 Run `npm run test:package` in this directory. It packs the library, installs the tarball in a fresh app, and synthesizes all three configurations using offline fixtures.
