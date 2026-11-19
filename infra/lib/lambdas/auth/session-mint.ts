@@ -20,7 +20,7 @@ export async function mintFirstPartySession(
 // Resolves the caller's approved DIDs via `resolveApprovedDids`, requires the
 // requested `targetDid` to match one EXACTLY (no fuzzy/handle fallback). Then
 // branches:
-//   - apex DID  → mint via `apexTenant()` (no DDB read; apex is in-process).
+//   - apex DID  → mint with the deployment identity used by the entitlement check.
 //   - tenant DID → re-query TenantsTable by `did` PK to recover the full row,
 //     including `signingKeyRef` (the `Tenant` shape requires it per Spec #2's
 //     keypair-per-tenant invariant), then mint.
@@ -45,7 +45,12 @@ export async function mintFirstPartySessionFor(
 
   let t: Tenant
   if (match.did === deps.apexDid) {
-    t = apexTenant()
+    t = {
+      ...apexTenant(),
+      did: deps.apexDid,
+      handle: deps.apexHandle,
+      pdsEndpoint: `https://${deps.apexHandle}`,
+    }
   } else {
     // Re-query TenantsTable by DID PK to recover `signingKeyRef` (and re-confirm
     // the row is still live). Belt-and-suspenders vs. the entitlement listing,
