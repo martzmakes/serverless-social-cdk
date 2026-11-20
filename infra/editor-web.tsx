@@ -2,7 +2,7 @@ export { PublishingCalendar } from "./publishing-calendar-web";
 import {
   useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode,
 } from "react";
-import { createEditorClient, draftMarkdown, type DraftFields, type DraftSummary, type EditorDraft, type PostKind } from "./editor";
+import { createEditorClient, draftMarkdown, insertDraftImage, type DraftFields, type DraftSummary, type EditorDraft, type PostKind } from "./editor";
 
 type Client = ReturnType<typeof createEditorClient>;
 type Published = Awaited<ReturnType<Client["published"]>>["posts"];
@@ -54,6 +54,8 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
   const [preview, setPreview] = useState(false);
   const [copied, setCopied] = useState(false);
   const latest = useRef<{ draft?: EditorDraft; fields?: DraftFields }>({});
+  const bodyInput = useRef<HTMLTextAreaElement>(null);
+  const bodyCursor = useRef<number>(undefined);
   const queue = useRef<Promise<void>>(Promise.resolve());
   const foreground = useRef(false);
   const hasUnsavedChanges = !!draft && !!fields && fields !== draft.fields;
@@ -63,6 +65,7 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
 
   const open = useCallback((next?: EditorDraft) => {
     latest.current = { draft: next, fields: next?.fields };
+    bodyCursor.current = undefined;
     setDraft(next);
     setFields(next?.fields);
     setTagText(next?.fields.tags.join(", ") ?? "");
@@ -264,8 +267,9 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
             change({ tags: event.target.value.split(",").map(tag => tag.trim()).filter(Boolean).slice(0, 12) });
           }} /></label>
         </>}
-        <label>{longform ? "Article body (Markdown)" : "Post text"}<textarea rows={longform ? 14 : 5}
-          value={fields.content} onChange={event => change({ content: event.target.value })} />
+        <label>{longform ? "Article body (Markdown)" : "Post text"}<textarea ref={bodyInput} rows={longform ? 14 : 5}
+          value={fields.content} onChange={event => change({ content: event.target.value })}
+          onSelect={event => { bodyCursor.current = event.currentTarget.selectionEnd; }} />
         </label>
         {!longform && <small>{[...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(fields.content)].length}/300 characters</small>}
         <div className="ss-row">
@@ -295,9 +299,14 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
               change({ images: fields.images.map(item => item.id === image.id ? { ...item, alt: event.target.value } : item) })
             } /></label>
             <div className="ss-row">
-              {longform && <button type="button" onClick={() => change({
-                content: `${fields.content}\n\n![${image.alt.replace(/[\[\]\\\n\r]/g, " ")}](draft-image:${image.id})`,
-              })}>Insert into article</button>}
+              {longform && <button type="button" onClick={() => {
+                const inserted = insertDraftImage(fields.content, image, bodyCursor.current);
+                change({ content: inserted.content });
+                requestAnimationFrame(() => {
+                  bodyInput.current?.focus();
+                  bodyInput.current?.setSelectionRange(inserted.cursor, inserted.cursor);
+                });
+              }}>Insert into article</button>}
               <button type="button" onClick={() => change({
                 images: fields.images.filter(item => item.id !== image.id),
                 content: fields.content.replace(

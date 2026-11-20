@@ -4,6 +4,7 @@ import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { GetParameterCommand, SSMClient } from "@aws-sdk/client-ssm";
 import { resolveApprovedDids } from "../auth/entitlements";
+import { sharingHosts } from "../auth/site-sharing";
 import { mintFirstPartySessionFor } from "../auth/session-mint";
 import { collectionFor, HttpError, mediaKey, type Draft, type RecordValue } from "./model";
 import type { PostKind } from "../../../editor";
@@ -27,13 +28,10 @@ const entitlements = {
 };
 
 export const approvedIdentities = (email: string) => resolveApprovedDids(email, entitlements);
-
-export async function authorize(email: string, did: string) {
-  const approved = await approvedIdentities(email);
-  if (!approved.some(entitlement => entitlement.did === did)) {
-    throw new HttpError(403, "This session cannot edit the selected identity.");
-  }
-}
+export const sharing = {
+  ddb, domain, apexDid: entitlements.apexDid, table: env.SITE_SHARING_TABLE,
+  hosts: sharingHosts(domain, env.KNOWN_TENANT_HOSTS),
+};
 
 let secret: Uint8Array | undefined;
 export async function publicationToken(email: string, did: string) {

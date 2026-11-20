@@ -56,6 +56,10 @@ export type ArticleReply = {
 };
 export type ReplySubmission = { status: "sent" | "queued"; url: string };
 export type ArticleReplies = { replies: ArticleReply[]; unavailable: ReplyNetwork[]; next?: string };
+export type ReplyQueueThread = ArticleReplies & { article: InsightArticle };
+export type ReplyQueuePage = { threads: ReplyQueueThread[]; next?: string };
+export type SharingDirections = { outgoing: boolean; incoming: boolean };
+export type SiteSharing = { host: string; peers: ({ host: string } & SharingDirections)[] };
 
 export const SHARE_SOURCES = [
   "linkedin", "instagram", "facebook", "bluesky", "fediverse", "x", "reddit", "threads", "email", "rss",
@@ -91,8 +95,14 @@ export function createInsightsClient({ origin, token }: { origin: string; token:
   }
   return {
     sites: () => request<{ sites: InsightSite[] }>(""),
+    sharing: () => request<SiteSharing>("/sharing"),
+    updateSharing: (peer: string, directions: SharingDirections) =>
+      request<SharingDirections>("/sharing", undefined, { peer, ...directions }),
     articles: (did: string, after?: string) => request<{ articles: InsightArticle[]; next?: string }>(
       "/articles", { did, ...(after ? { after } : {}) },
+    ),
+    replyQueue: (did: string, after?: string) => request<ReplyQueuePage>(
+      "/replies", { did, ...(after ? { after } : {}) },
     ),
     replies: (did: string, rkey: string, after?: string) => request<ArticleReplies>(
       `/articles/${encodeURIComponent(rkey)}/replies`, { did, ...(after ? { after } : {}) },

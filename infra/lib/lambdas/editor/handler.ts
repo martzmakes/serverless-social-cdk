@@ -5,6 +5,7 @@ import { CopyObjectCommand, DeleteObjectCommand, DeleteObjectsCommand, GetObject
 import { CreateScheduleCommand, DeleteScheduleCommand, SchedulerClient } from "@aws-sdk/client-scheduler";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { verifyJwt } from "../auth/lib/jwt";
+import { canShare, publishingHost, workspaceHost, workspaceSites } from "../auth/site-sharing";
 import { mdToSafeHtml } from "../pds/longform-render";
 import { emptyDraftFields, type EditorDraft, type PostKind } from "../../../editor";
 import {
@@ -12,8 +13,8 @@ import {
   requireEditable, scheduleTime, uuidPattern, validateFields, validatePublication, type Draft, type Job,
 } from "./model";
 import {
-  approvedIdentities, authorize, bucket, ddb, domain, env, getDraft, getRecord, getSharedDraft, PdsError,
-  previewUrls, s3, saveDraft, table, xrpc, type PublishedRecord,
+  approvedIdentities, bucket, ddb, domain, env, getDraft, getRecord, getSharedDraft, PdsError,
+  previewUrls, s3, saveDraft, sharing, table, xrpc, type PublishedRecord,
 } from "./runtime";
 
 const scheduler = new SchedulerClient({});
@@ -176,17 +177,37 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     if (path[0] === "share" && path.length > 1 && method === "GET") return await share(path);
     const bearer = /^Bearer (\S+)$/i.exec(event.headers.authorization ?? "");
     if (!bearer) throw new HttpError(401, "Sign in to use the editor.");
-    const { email } = await verifyJwt(bearer[1]).catch(() => {
+    const session = await verifyJwt(bearer[1]).catch(() => {
       throw new HttpError(401, "Sign in to use the editor.");
     });
+    const { email } = session;
+    const host = workspaceHost(session, event.headers["x-pds-viewer-host"], sharing);
+    if (!host) throw new HttpError(403, "Sign in on this site to open its workspace.");
+    const approved = await approvedIdentities(email);
     if (path.length === 1 && path[0] === "identities" && method === "GET") {
-      const identities = await approvedIdentities(email);
-      return json(200, { identities: identities.map(({ did, handle }) => ({ did, handle })) });
+      const visible = await workspaceSites(sharing, approved, host);
+      const identities = await Promise.all(visible.map(async identity => {
+        const { did, handle } = identity;
+        if (!sharing.table) return { did, handle };
+        const from = publishingHost(identity, sharing);
+        const targets = await Promise.all(approved.filter(target => target.did !== did).map(async target => {
+          const to = publishingHost(target, sharing);
+          if (!await canShare(sharing, from, to)) return;
+          return { did: target.did, handle: target.handle, ...(visible.includes(target) ? {} : { host: to }) };
+        }));
+        return { did, handle, copyTargets: targets.filter(Boolean) };
+      }));
+      return json(200, { identities });
     }
     const query = event.queryStringParameters ?? {};
     const { did } = query;
     if (!did || !did.startsWith("did:") || did.length > 512) throw new HttpError(400, "Choose an identity.");
-    await authorize(email, did);
+    const identity = approved.find(candidate => candidate.did === did);
+    if (!identity) throw new HttpError(403, "This session cannot edit the selected identity.");
+    const sourceHost = publishingHost(identity, sharing);
+    if (!await canShare(sharing, sourceHost, host)) {
+      throw new HttpError(403, "The selected site’s content is unavailable in this workspace.");
+    }
 
     if (path[0] === "published" && path.length === 1 && method === "GET") {
       const kind = validKind(query.kind);
@@ -255,7 +276,11 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
           || typeof requestId !== "string" || !uuidPattern.test(requestId)) {
         throw new HttpError(400, "Choose a different publishing identity.");
       }
-      await authorize(email, targetDid);
+      const destination = approved.find(candidate => candidate.did === targetDid);
+      if (!destination) throw new HttpError(403, "This session cannot edit the selected identity.");
+      if (!await canShare(sharing, sourceHost, publishingHost(destination, sharing))) {
+        throw new HttpError(403, "Cross-site sharing is disabled for this draft’s destination.");
+      }
       return json(201, await view(await copyDraft(draft, targetDid, requestId), event));
     }
     let next: Draft;

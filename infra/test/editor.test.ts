@@ -4,12 +4,14 @@ import type { APIGatewayProxyEventV2, Context, SQSEvent } from "aws-lambda";
 const fixture = vi.hoisted(() => {
   process.env.DRAFTS_TABLE = "drafts";
   process.env.DOMAIN = "social.example.com";
-  process.env.KNOWN_TENANT_HOSTS = "writer.example.com";
+  process.env.KNOWN_TENANT_HOSTS = "writer.example.com,second.example.com";
+  process.env.SITE_SHARING_TABLE = "sharing";
   process.env.XRPC_ORIGIN = "https://origin.example.com";
   process.env.DRAFT_MEDIA_BUCKET = "draft-media";
   return {
     drafts: new Map<string, any>(),
     shares: new Map<string, any>(),
+    policies: new Map<string, object>(),
     media: new Map<string, Buffer>(),
     scheduled: [] as any[],
     messages: [] as string[],
@@ -43,6 +45,9 @@ vi.mock("@aws-sdk/lib-dynamodb", async importOriginal => {
       from: () => ({
         async send(command: any) {
           if (command instanceof sdk.GetCommand) {
+            if (command.input.TableName === "sharing") {
+              return { Item: fixture.policies.get(`${command.input.Key?.pk}/${command.input.Key?.sk}`) };
+            }
             return { Item: structuredClone(fixture.drafts.get(key(command.input.Key as any))) };
           }
           if (command instanceof sdk.PutCommand) {
@@ -111,17 +116,26 @@ vi.mock("@aws-sdk/client-sqs", () => ({
 
 import { handler as editor } from "../lib/lambdas/editor/handler";
 import { handler as worker } from "../lib/lambdas/editor/worker";
-import { emptyDraftFields, type EditorDraft, type PostKind } from "../editor";
+import { emptyDraftFields, insertDraftImage, type EditorDraft, type PostKind } from "../editor";
+
+it("inserts a diagram at the article cursor without removing surrounding prose", () => {
+  const image = { id: "diagram", alt: "Two sites [one firehose]" };
+  const marker = "![Two sites  one firehose ](draft-image:diagram)";
+  expect(insertDraftImage("Before\n\nAfter", image, 6)).toEqual({
+    content: `Before\n\n${marker}\n\nAfter`, cursor: 8 + marker.length,
+  });
+  expect(insertDraftImage("Before", image).content).toBe(`Before\n\n${marker}`);
+});
 
 const did = "did:web:writer.example.com";
-async function request(method: string, path = "", payload?: object | Buffer, token: string | null = "writer.example.com", repo = did) {
+async function request(method: string, path = "", payload?: object | Buffer, token: string | null = "writer.example.com", repo = did, host = "writer.example.com") {
   const url = new URL(`https://writer.example.com/auth/editor${path}`);
   if (!url.searchParams.has("did")) url.searchParams.set("did", repo);
   const result = await editor({
     version: "2.0", routeKey: "$default", rawQueryString: url.search.slice(1),
     rawPath: url.pathname,
     requestContext: { http: { method } },
-    headers: { authorization: token ? `Bearer ${token}` : "", "x-pds-viewer-host": "writer.example.com" },
+    headers: { authorization: token ? `Bearer ${token}` : "", "x-pds-viewer-host": host },
     queryStringParameters: Object.fromEntries(url.searchParams),
     isBase64Encoded: Buffer.isBuffer(payload),
     body: Buffer.isBuffer(payload) ? payload.toString("base64") : JSON.stringify(payload),
@@ -146,6 +160,7 @@ describe("editor authorization and publication", () => {
     fixture.drafts.clear();
     fixture.shares.clear();
     fixture.media.clear();
+    fixture.policies.clear();
     fixture.scheduled.length = 0;
     fixture.messages.length = 0;
     vi.stubGlobal("fetch", vi.fn());
@@ -154,8 +169,10 @@ describe("editor authorization and publication", () => {
   it("stores images privately and revokes both shared HTML and media despite an out-of-date index", async () => {
     const draft = await create("longform");
     const identities = await request("GET", "/identities");
+    const writer = { did, handle: "writer.example.com" };
+    const second = { did: "did:web:second.example.com", handle: "second.example.com" };
     expect(JSON.parse(identities.body)).toEqual({ identities: [
-      { did, handle: "writer.example.com" }, { did: "did:web:second.example.com", handle: "second.example.com" },
+      { ...writer, copyTargets: [second] }, { ...second, copyTargets: [writer] },
     ] });
     expect((await request("GET", `/${draft.id}`, undefined, null)).status).toBe(401);
     expect((await request("GET", `/${draft.id}`, undefined, "other.example.com")).status).toBe(403);
@@ -185,6 +202,19 @@ describe("editor authorization and publication", () => {
     expect((await request("GET", path, undefined, null)).status).toBe(410);
     expect((await request("GET", `${path}/media/${image}`, undefined, null)).status).toBe(410);
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("denies a draft read and copy across a disabled direction while the source remains editable", async () => {
+    const draft = await create("longform");
+    const target = "second.example.com";
+    fixture.policies.set(`SITE_SHARING#${target}/writer.example.com`, { incoming: false, outgoing: true });
+    const catalog = await request("GET", "/identities", undefined, "writer.example.com", did, target);
+    expect(JSON.parse(catalog.body).identities.map((identity: { handle: string }) => identity.handle)).toEqual([target]);
+    expect((await request("GET", `/${draft.id}`, undefined, "writer.example.com", did, target)).status).toBe(403);
+    expect((await request("GET", `/${draft.id}`)).status).toBe(200);
+    expect((await request("POST", `/${draft.id}/copy`, {
+      version: draft.version, targetDid: `did:web:${target}`, requestId: "2f0a507d-55b0-4640-a1ee-c32adb0ea536",
+    })).status).toBe(403);
   });
 
   it("ignores deliveries from a canceled or replaced schedule", async () => {

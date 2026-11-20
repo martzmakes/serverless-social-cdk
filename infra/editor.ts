@@ -29,6 +29,7 @@ export type EditorDraft = {
 
 export type DraftSummary = Pick<EditorDraft, "id" | "kind" | "state" | "updatedAt" | "scheduledAt">
   & { title: string };
+export type EditorIdentity = { did: string; handle: string; copyTargets?: { did: string; handle: string; host?: string }[] };
 
 export function emptyDraftFields(): DraftFields {
   return { content: "", title: "", slug: "", excerpt: "", tags: [], teaser: "", syndicate: true, images: [] };
@@ -36,6 +37,15 @@ export function emptyDraftFields(): DraftFields {
 
 function imageLabel(alt: string) {
   return alt.replace(/[\[\]\\\n\r]/g, " ");
+}
+
+export function insertDraftImage(content: string, image: DraftFields["images"][number], at = content.length) {
+  const before = content.slice(0, at);
+  const after = content.slice(at);
+  const leftBreaks = before ? 2 - (before.match(/\n{1,2}$/)?.[0].length ?? 0) : 0;
+  const rightBreaks = after ? 2 - (after.match(/^\n{1,2}/)?.[0].length ?? 0) : 0;
+  const prefix = before + "\n".repeat(leftBreaks) + `![${imageLabel(image.alt)}](draft-image:${image.id})`;
+  return { content: prefix + "\n".repeat(rightBreaks) + after, cursor: prefix.length };
 }
 
 /** Resolve editor-only image markers and append attached images without an inline position. */
@@ -92,7 +102,7 @@ export function createEditorClient(options: {
   }
   const item = (id: string) => `/${encodeURIComponent(id)}`;
   return {
-    identities: () => request<{ identities: { did: string; handle: string }[] }>("/identities"),
+    identities: () => request<{ identities: EditorIdentity[] }>("/identities"),
     list: (after?: string) => request<{ drafts: DraftSummary[]; cursor?: string }>(
       after ? `?after=${encodeURIComponent(after)}` : ""),
     published: (kind: PostKind, after?: string) => request<{

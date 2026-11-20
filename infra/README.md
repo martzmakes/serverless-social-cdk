@@ -148,6 +148,18 @@ The report counts page requests classified as human, grouped by day. It estimate
 
 Existing per-site daily totals and referrer domains remain available. Source and device coverage starts when the updated aggregator processes logs. The rollup keeps counters and reduced referrer domains. Original access logs stay in the private bucket and expire after 30 days. The report uses the article's current canonical slug. It shows the latest saved Bluesky engagement snapshot when available, the Fediverse article object, and the Open Graph metadata from the published page. Open Article replies to read the Bluesky conversation alongside public and unlisted direct replies received over ActivityPub. Fediverse reply collection starts when the updated inbox handler is deployed and retains each reply for 90 days. The inbox lets an author send a reply from the selected publishing identity and mark a reply handled or reopen it. The handled state is private and shared across sites for that identity and article. Bluesky sends an AT Protocol reply with the original thread root and parent. Fediverse sends a signed ActivityPub reply to the commenter's instance, and transient failures use the existing delivery queue. A later Fediverse reply to one of the site's replies appears under the same article.
 
+## Add article replies to the signed-in inbox
+
+Import `ArticleReplyQueue` from `@martzmakes/serverless-social/insights-web` and render `<ArticleReplyQueue client={client} />` with the same authenticated insights client. The queue merges replies across approved sites and sorts loaded replies by reply time. Search matches the loaded reply text, author, and article title. The site and network filters apply to both Open and Handled. Undo reverses your last status change.
+
+The queue loads up to eight index entries at a time per site. **Load older articles** adds conversations from earlier articles. **Older Mastodon replies** loads further pages of a busy Fediverse conversation. Each load uses the existing publication index, stored ActivityPub replies, and Bluesky App View. The queue reports partial results when a source is unavailable and needs no background polling.
+
+## Configure cross-site sharing
+
+Render `<SiteSharingSettings client={client} />` from `@martzmakes/serverless-social/insights-web` in the signed-in settings of each site. An owner can limit both the site's outgoing sharing and the content it accepts from each connected site. A direction is available only when the source allows outgoing sharing and the destination allows incoming sharing. Existing deployments start with both directions enabled. A session created before site-bound sign-in requires a new sign-in on the site to save settings.
+
+The server checks site membership and sharing before listing or operating on another site's drafts, analytics, and article replies. Copying drafts requires both publishing identities and an allowed direction from source to destination. Public posts, federation, unlisted preview links, and copies already made keep their existing access rules.
+
 ## Article link previews
 
 Set `coverImage` on a published longform record to use that image in its Open Graph and X card. For PNG and JPEG covers stored as platform blobs, the renderer writes a 1200 × 630 JPEG to the site bucket and serves it from CloudFront. The article retains the original image. Set `coverImageAlt` to describe the cover or give the matching image in the Markdown body alt text. External cover URLs are included directly in the metadata.

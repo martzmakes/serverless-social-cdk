@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
-import { createEditorClient, type DraftSummary } from "./editor";
+import { createEditorClient, type DraftSummary, type EditorIdentity } from "./editor";
 
-type Identity = { did: string; handle: string };
+type Identity = EditorIdentity & { host?: string };
 type Client = ReturnType<typeof createEditorClient>;
 type Entry = { draft: DraftSummary; identity: Identity };
 type DraftPage = { drafts: DraftSummary[]; cursor?: string; error?: string };
@@ -21,7 +21,7 @@ function errorMessage(error: unknown) {
 export function PublishingCalendar({ origin, token, onOpen }: {
   origin: string;
   token: () => Promise<string | null>;
-  onOpen: (draft: Pick<DraftSummary, "id" | "kind">, did: string) => void;
+  onOpen: (draft: Pick<DraftSummary, "id" | "kind">, did: string, host?: string) => void;
 }) {
   const clientFor = useCallback((did: string) => createEditorClient({ origin, did, token }), [origin, token]);
   const [identities, setIdentities] = useState<Identity[]>();
@@ -78,7 +78,7 @@ export function PublishingCalendar({ origin, token, onOpen }: {
   const render = (entry: Entry) => <CalendarEntry
     key={`${entry.identity.did}:${entry.draft.id}`}
     entry={entry}
-    targets={(identities ?? []).filter(identity => identity.did !== entry.identity.did)}
+    targets={entry.identity.copyTargets ?? (identities ?? []).filter(identity => identity.did !== entry.identity.did)}
     client={clientFor(entry.identity.did)}
     onOpen={onOpen}
   />;
@@ -111,7 +111,7 @@ function CalendarEntry({ entry, targets, client, onOpen }: {
   entry: Entry;
   targets: Identity[];
   client: Client;
-  onOpen: (draft: Pick<DraftSummary, "id" | "kind">, did: string) => void;
+  onOpen: (draft: Pick<DraftSummary, "id" | "kind">, did: string, host?: string) => void;
 }) {
   const { draft, identity } = entry;
   const [target, setTarget] = useState("");
@@ -129,7 +129,7 @@ function CalendarEntry({ entry, targets, client, onOpen }: {
     try {
       const source = await client.get(draft.id);
       const created = await client.copy(draft.id, source.version, target, request);
-      onOpen(created, target);
+      onOpen(created, target, targets.find(site => site.did === target)?.host);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {

@@ -4,8 +4,9 @@ import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { parse, parseFragment, type DefaultTreeAdapterTypes } from "parse5";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
-import { DEVICES, SOURCES, type ArticleDistribution, type ArticleInsights, type ArticleReplies, type InsightArticle, type InsightSite } from "../../../insights";
+import { DEVICES, SOURCES, type ArticleDistribution, type ArticleInsights, type ArticleReplies, type InsightArticle, type InsightSite, type ReplyQueuePage } from "../../../insights";
 import { resolveApprovedDids } from "../auth/entitlements";
+import { canShare, readSharing, saveSharing, sharingHosts, workspaceHost, workspaceSites } from "../auth/site-sharing";
 import { verifyJwt } from "../auth/lib/jwt";
 import { articleRepliesPartition, type TimelineItem } from "../ap/ingest";
 import { safeHttpsUrl } from "../ap/sanitize";
@@ -30,6 +31,10 @@ const entitlements = {
   apexHandle,
   tenantsTable: process.env.TENANTS_TABLE!,
   allowedEmails: (process.env.ALLOWED_EMAILS ?? "").split(",").map(email => email.trim()).filter(Boolean),
+};
+const sharing = {
+  domain, apexDid, ddb, table: process.env.SITE_SHARING_TABLE,
+  hosts: sharingHosts(domain, process.env.KNOWN_TENANT_HOSTS),
 };
 const replyContext = {
   entitlements, analyticsTable, inboundTable, apiOrigin: process.env.REPLY_API_ORIGIN!,
@@ -209,6 +214,44 @@ async function articleReplies(site: InsightSite, item: IndexItem, after?: string
   return { replies, unavailable, ...(fedi.status === "fulfilled" ? { next: fedi.value.next } : {}) };
 }
 
+async function articleIndexPage(pk: string, limit: number, after?: string) {
+  return ddb.send(new QueryCommand({
+    TableName: indexTable,
+    KeyConditionExpression: "pk = :pk",
+    ExpressionAttributeValues: { ":pk": pk },
+    ScanIndexForward: false,
+    Limit: limit,
+    ExclusiveStartKey: after ? { pk, sk: after } : undefined,
+  }));
+}
+
+async function replyQueue(site: InsightSite, pk: string, after?: string): Promise<ReplyQueuePage> {
+  // Each request reads one bounded page of the site's publication index. It
+  // uses the same two live sources and state as an individual conversation.
+  const page = await articleIndexPage(pk, 8, after);
+  const threads = await Promise.all((page.Items ?? []).flatMap(row => {
+    const item = row.item as IndexItem | undefined;
+    const article = getArticle(item, site);
+    if (!item || !article) return [];
+    return [(async () => {
+      const conversation = await articleReplies(site, item);
+      const replies = await readHandled(replyContext, site.did, item.rkey, conversation.replies);
+      return {
+        ...conversation,
+        article,
+        replies: replies.map(reply => ({
+          ...reply,
+          text: reply.text.length > 500 ? reply.text.slice(0, 500).trimEnd() + "…" : reply.text,
+        })),
+      };
+    })()];
+  }));
+  return {
+    threads: threads.filter(thread => thread.replies.length || thread.unavailable.length || thread.next),
+    next: page.LastEvaluatedKey?.sk,
+  };
+}
+
 async function report(site: InsightSite, item: IndexItem, article: InsightArticle, days: number): Promise<ArticleInsights> {
   const today = Math.floor(Date.now() / MS_PER_DAY) * MS_PER_DAY;
   const filteredDays = Array.from({ length: days }, (_, i) => isoDay(today - (days - 1 - i) * MS_PER_DAY));
@@ -277,10 +320,16 @@ export async function handler(event: APIGatewayProxyEventV2) {
   if (!session) return json(401, { message: "Sign in to view article analytics." });
   const path = event.rawPath.replace(/\/$/, "");
   const method = event.requestContext?.http?.method ?? "GET";
-  if (method !== "GET" && !(method === "POST" && path.endsWith("/replies"))) {
+  const sharingPath = path === `${base}/sharing`;
+  const articleAction = path.startsWith(`${base}/articles/`) && path.endsWith("/replies");
+  if (method !== "GET" && !(method === "POST" && (sharingPath || articleAction))) {
     return json(405, { message: "Unsupported article action." });
   }
-  if (path !== base && !path.startsWith(`${base}/articles`)) return json(404, { message: "Analytics route unavailable." });
+  if (path !== base && !sharingPath && path !== `${base}/replies` && !path.startsWith(`${base}/articles`)) {
+    return json(404, { message: "Analytics route unavailable." });
+  }
+  const host = workspaceHost(session, event.headers["x-pds-viewer-host"], sharing);
+  if (!host) return json(403, { message: "Sign in on this site to open its workspace." });
 
   try {
     const approved = await resolveApprovedDids(session.email, entitlements);
@@ -288,22 +337,36 @@ export async function handler(event: APIGatewayProxyEventV2) {
       if (did === apexDid) return [{ did, handle, host: domain }];
       return handle !== domain && tenantHosts.has(handle) ? [{ did, handle, host: handle }] : [];
     });
-    if (path === base) return json(200, { sites });
+    if (sharingPath) {
+      if (!sites.some(site => site.host === host)) return json(403, { message: "Only this site’s owner can change its sharing settings." });
+      if (method === "POST") {
+        if (session.siteHost !== host) return json(403, { message: "Sign in again on this site before changing its sharing settings." });
+        if (Buffer.byteLength(event.body ?? "") > 1000) return json(413, { message: "Sharing settings are too large." });
+        let input: { peer?: unknown; incoming?: unknown; outgoing?: unknown } | undefined;
+        try { input = JSON.parse(event.body ?? ""); } catch { /* Invalid input is handled below. */ }
+        const { peer, incoming, outgoing } = input ?? {};
+        if (typeof peer !== "string" || peer === host || !sharing.hosts.has(peer) ||
+            typeof incoming !== "boolean" || typeof outgoing !== "boolean") {
+          return json(400, { message: "Choose a connected site and both sharing directions." });
+        }
+        await saveSharing(sharing, host, peer, { incoming, outgoing });
+        return json(200, { incoming, outgoing });
+      }
+      const peers = await Promise.all([...sharing.hosts].filter(peer => peer !== host)
+        .map(async peer => ({ host: peer, ...await readSharing(sharing, host, peer) })));
+      return json(200, { host, peers });
+    }
+    if (path === base) return json(200, { sites: await workspaceSites(sharing, sites, host) });
 
     const params = event.queryStringParameters ?? {};
     const site = sites.find(candidate => candidate.did === params.did);
     if (!site) return json(403, { message: "This session cannot view analytics for the selected site." });
+    if (!await canShare(sharing, site.host, host)) return json(403, { message: "The selected site’s content is unavailable in this workspace." });
     const pk = site.did === apexDid ? "IDX" : `IDX#${site.did}`;
-    if (path === `${base}/articles`) {
+    if (path === `${base}/articles` || path === `${base}/replies`) {
       if (params.after !== undefined && !recordKey.test(params.after)) return json(400, { message: "Invalid article cursor." });
-      const result = await ddb.send(new QueryCommand({
-        TableName: indexTable,
-        KeyConditionExpression: "pk = :pk",
-        ExpressionAttributeValues: { ":pk": pk },
-        ScanIndexForward: false,
-        Limit: 30,
-        ExclusiveStartKey: params.after ? { pk, sk: params.after } : undefined,
-      }));
+      if (path === `${base}/replies`) return json(200, await replyQueue(site, pk, params.after));
+      const result = await articleIndexPage(pk, 30, params.after);
       const articles = (result.Items ?? []).flatMap(row => {
         const article = getArticle(row.item, site);
         return article ? [article] : [];

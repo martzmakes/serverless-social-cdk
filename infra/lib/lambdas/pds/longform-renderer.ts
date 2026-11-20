@@ -73,7 +73,6 @@ export async function processEvent(ev: RenderEvent, p: Ports, ctx: RenderCtx, s3
     }
     if (prev.syndication.bsky) await p.deleteSyndication(prev.syndication.bsky.uri, sc)
     const deletedItem = applyDelete(prev)
-    await p.putIndex(deletedItem, sc)
     // Build feeds from the live index, replacing the deleted item in-memory
     const allIndex = await p.listIndex(sc)
     const updatedIndex = allIndex.map(i => i.rkey === deletedItem.rkey ? deletedItem : i)
@@ -82,6 +81,9 @@ export async function processEvent(ev: RenderEvent, p: Ports, ctx: RenderCtx, s3
     if (!sc.isApex) {
       await p.putObject(`${s3Prefix}index.html`, renderIndexPage(updatedIndex, ctx), 'text/html; charset=utf-8')
     }
+    // Leave the index pending until all derived pages and feeds are written.
+    // A retry after a failed write must still rerun the delete projection.
+    await p.putIndex(deletedItem, sc)
     return
   }
 

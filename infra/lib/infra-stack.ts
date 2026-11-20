@@ -329,11 +329,13 @@ export class InfraStack extends cdk.Stack {
         ALLOWED_EMAILS: allowedEmails,
       },
     };
+    const postAnalytics = new PostAnalyticsTable(this, "PostAnalyticsTable");
 
     if (props.editor) {
       new PostEditor(this, "PostEditor", {
         api: authHttpApi,
         tenants: tenantsTable.table,
+        sharingTable: postAnalytics.table,
         jwtSecret: jwtSecretParam,
         environment: {
           DOMAIN,
@@ -1429,8 +1431,6 @@ export class InfraStack extends cdk.Stack {
       lifecycleRules: [{ expiration: cdk.Duration.days(30) }],
     });
 
-    const postAnalytics = new PostAnalyticsTable(this, "PostAnalyticsTable");
-
     const postInsights = new lambda.NodejsFunction(this, "PostInsights", {
       ...lambdaDefaults,
       timeout: cdk.Duration.seconds(27),
@@ -1444,6 +1444,7 @@ export class InfraStack extends cdk.Stack {
         TENANTS_TABLE: tenantsTable.table.tableName,
         LONGFORM_INDEX_TABLE: longformIndex.table.tableName,
         POST_ANALYTICS_TABLE: postAnalytics.table.tableName,
+        SITE_SHARING_TABLE: postAnalytics.table.tableName,
         SITE_BUCKET: siteBucket.bucketName,
         AP_CUSTOM_HOSTS: KNOWN_TENANT_HOSTS,
         AP_INBOUND_TABLE: apInboundPostsTable.tableName,
@@ -1467,6 +1468,10 @@ export class InfraStack extends cdk.Stack {
       conditions: { "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["REPLY_STATE#*", "REPLY_SEND#*"] } },
     }));
     postInsights.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:PutItem"], resources: [postAnalytics.table.tableArn],
+      conditions: { "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["SITE_SHARING#*"] } },
+    }));
+    postInsights.addToRolePolicy(new iam.PolicyStatement({
       actions: ["dynamodb:GetItem"],
       resources: [apInboundPostsTable.tableArn],
       conditions: { "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["*#article-replies"] } },
@@ -1478,12 +1483,14 @@ export class InfraStack extends cdk.Stack {
     }));
 
     const replyPath = "/auth/insights/articles/{rkey}/replies";
+    const sharingPath = "/auth/insights/sharing";
     const insightsIntegration = new apigwv2Integrations.HttpLambdaIntegration("PostInsightsIntegration", postInsights);
     for (const path of [
       "/auth/insights", "/auth/insights/articles", "/auth/insights/articles/{rkey}", "/auth/insights/articles/{rkey}/distribution",
-      replyPath,
+      replyPath, "/auth/insights/replies", sharingPath,
     ]) {
-      const methods = path === replyPath ? [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST] : [apigwv2.HttpMethod.GET];
+      const methods = path === replyPath || path === sharingPath
+        ? [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST] : [apigwv2.HttpMethod.GET];
       authHttpApi.addRoutes({ path, methods, integration: insightsIntegration });
     }
 

@@ -284,7 +284,13 @@ export function makeAwsPorts(): Ports {
         headers: { 'content-type': 'application/json', authorization: `Bearer ${await accessJwt(scope)}` },
         body: JSON.stringify({ repo: repoDid(scope), collection: 'app.bsky.feed.post', rkey }),
       })
-      if (!res.ok) throw new Error(`deleteSyndication ${res.status} ${await res.text()}`)
+      if (!res.ok) {
+        const body = await res.text()
+        let code: unknown
+        try { code = JSON.parse(body)?.error } catch { /* Preserve non-JSON failures below. */ }
+        if (res.status === 400 && code === 'RecordNotFound') return
+        throw new Error(`deleteSyndication ${res.status} ${body}`)
+      }
     },
   }
 }

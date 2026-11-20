@@ -7,16 +7,19 @@ const db = vi.hoisted(() => {
   process.env.KNOWN_TENANT_HOSTS = "writer.example.net,other.example.net";
   process.env.LONGFORM_INDEX_TABLE = "index";
   process.env.POST_ANALYTICS_TABLE = "reports";
+  process.env.SITE_SHARING_TABLE = "sharing";
   process.env.SITE_BUCKET = "pages";
   process.env.AP_INBOUND_TABLE = "ap-inbound";
   process.env.REPLY_API_ORIGIN = "https://api.example.net";
   process.env.AP_CUSTOM_HOSTS = "writer.example.net";
-  return { send: vi.fn(), readPage: vi.fn(), mint: vi.fn() };
+  return { send: vi.fn(), policies: new Map<string, object>(), readPage: vi.fn(), mint: vi.fn() };
 });
 vi.mock("../lib/lambdas/auth/session-mint", () => ({ mintFirstPartySessionFor: db.mint }));
 vi.mock("../lib/lambdas/auth/lib/jwt", () => ({
   loadAppJwtKey: async () => new Uint8Array([1, 2, 3]),
   verifyJwt: async (token: string) => {
+    if (token === "writer-site") return { email: "owner@example.net", siteHost: "writer.example.net" };
+    if (token === "apex-site") return { email: "owner@example.net", siteHost: "social.example.com" };
     if (token !== "valid") throw new Error("Invalid token");
     return { email: "owner@example.net" };
   },
@@ -34,7 +37,17 @@ vi.mock("@aws-sdk/client-s3", async importOriginal => ({
 }));
 vi.mock("@aws-sdk/lib-dynamodb", async importOriginal => ({
   ...await importOriginal<typeof import("@aws-sdk/lib-dynamodb")>(),
-  DynamoDBDocumentClient: { from: () => db },
+  DynamoDBDocumentClient: { from: () => ({
+    send(command: { input: { TableName?: string; Key?: { pk: string; sk: string }; Item?: { pk: string; sk: string } } }) {
+      const { TableName, Key, Item } = command.input;
+      if (TableName !== "sharing") return db.send(command);
+      if (Item) {
+        db.policies.set(`${Item.pk}/${Item.sk}`, Item);
+        return {};
+      }
+      return { Item: db.policies.get(`${Key!.pk}/${Key!.sk}`) };
+    },
+  }) },
 }));
 
 import { handler } from "../lib/lambdas/analytics/insights";
@@ -109,6 +122,7 @@ describe("CloudFront article attribution", () => {
 
 describe("author insights", () => {
   beforeEach(() => {
+    db.policies.clear();
     db.send.mockReset();
     db.readPage.mockReset();
     db.mint.mockReset();
@@ -143,6 +157,62 @@ describe("author insights", () => {
       next: "next",
     });
     expect(JSON.parse(result.body).articles).toHaveLength(1);
+  });
+
+  it("lets each host veto sharing in one direction and rejects settings writes from the other site's session", async () => {
+    const host = "writer.example.net";
+    const apex = "social.example.com";
+    const fromHost = (value: APIGatewayProxyEventV2, viewer: string) => ({
+      ...value, headers: { ...value.headers, "x-pds-viewer-host": viewer },
+    });
+    const settings = {
+      ...fromHost(event("/sharing", undefined, undefined, "Bearer writer-site"), host),
+      requestContext: { http: { method: "POST" } },
+      body: JSON.stringify({ peer: apex, outgoing: false, incoming: true }),
+    } as unknown as APIGatewayProxyEventV2;
+    expect((await handler(fromHost(settings, apex))).statusCode).toBe(403);
+    expect((await handler(settings)).statusCode).toBe(200);
+    const apexCatalog = await handler(event("", undefined, undefined, "Bearer apex-site"));
+    expect(JSON.parse(apexCatalog.body).sites.map((site: { host: string }) => site.host)).toEqual([apex]);
+    const writerCatalog = await handler(fromHost(event("", undefined, undefined, "Bearer writer-site"), host));
+    expect(JSON.parse(writerCatalog.body).sites.map((site: { host: string }) => site.host)).toEqual([apex, host]);
+    const forbidden = await handler(event("/replies", { did: ownerDid }, undefined, "Bearer apex-site"));
+    expect(forbidden.statusCode).toBe(403);
+    expect(db.send).not.toHaveBeenCalled();
+  });
+
+  it("bounds and authorizes the queue and keeps the site, article, and handled state attached to each reply", async () => {
+    expect((await handler(event("/replies", { did: ownerDid }, undefined, "invalid"))).statusCode).toBe(401);
+    expect((await handler(event("/replies", { did: "did:plc:unhosted" }))).statusCode).toBe(403);
+    expect((await handler(event("/replies", { did: ownerDid, after: "other/site" }))).statusCode).toBe(400);
+    expect(db.send).not.toHaveBeenCalled();
+    const later = { ...article, rkey: "post2", currentSlug: "another-article", syndication: {} };
+    db.send.mockImplementation(async ({ input }) => {
+      if (input.TableName === "index") return {
+        Items: [{ item: article }, { item: later }, { item: { ...later, rkey: "deleted", status: "deleted" } }],
+        LastEvaluatedKey: { pk: `IDX#${ownerDid}`, sk: "next" },
+      };
+      if (input.TableName === "ap-inbound") {
+        if (input.ExpressionAttributeValues[":first"] === "post2#") return { Items: [] };
+        return { Items: [{ sortKey: "post1#2026-11-19T11:00:00.000Z#ad6abcdef1234567", ttl: 1_900_000_000, item: {
+          id: remoteApUri, url: remoteApUri, published: "2026-11-19T11:00:00Z",
+          actor: { handle: "mastodon.example" }, content: "<p>hello</p>",
+        } }] };
+      }
+      return { Responses: { reports: input.RequestItems.reports.Keys } };
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 503 })));
+    const response = await handler(event("/replies", { did: ownerDid, after: "cursor" }));
+    expect(response.statusCode).toBe(200);
+    expect(db.send.mock.calls[0][0].input).toMatchObject({
+      TableName: "index", Limit: 8, ExclusiveStartKey: { pk: `IDX#${ownerDid}`, sk: "cursor" },
+    });
+    expect(JSON.parse(response.body)).toMatchObject({ next: "next", threads: [{
+      article: { rkey: "post1", url: "https://writer.example.net/an-article" },
+      replies: [{ id: remoteApUri, handled: true, text: "hello" }], unavailable: ["Bluesky"],
+    }] });
+    expect(JSON.parse(response.body).threads).toHaveLength(1);
+    expect(db.send.mock.calls.filter(([command]) => command.input.TableName === "ap-inbound")).toHaveLength(2);
   });
 
   it("retains legacy daily totals and domains while reporting coverage of new buckets, scoped to one host", async () => {

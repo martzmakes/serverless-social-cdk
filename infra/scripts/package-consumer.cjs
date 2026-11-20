@@ -5,6 +5,10 @@ const vm = require("node:vm");
 const { App, Stack } = require("aws-cdk-lib");
 const { HostedZone } = require("aws-cdk-lib/aws-route53");
 const { ServerlessSocialStack, ServerlessSocialSite } = require("@martzmakes/serverless-social");
+const { ArticleReplyQueue } = require("@martzmakes/serverless-social/insights-web");
+const { createInsightsClient } = require("@martzmakes/serverless-social/insights");
+assert.equal(typeof ArticleReplyQueue, "function");
+assert.equal(typeof createInsightsClient({ origin: "https://social.example.com", token: () => null }).replyQueue, "function");
 
 const env = { account: "123456789012", region: "us-east-1" };
 const context = {

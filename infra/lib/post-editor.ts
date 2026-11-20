@@ -16,12 +16,13 @@ import { lambdaSource } from "./lambda-assets";
 export interface PostEditorProps {
   api: HttpApi;
   tenants: ITable;
+  sharingTable?: ITable;
   jwtSecret: IStringParameter;
   environment: Record<string, string>;
 }
 
 export class PostEditor extends Construct {
-  constructor(scope: Construct, id: string, { api, tenants, jwtSecret, environment }: PostEditorProps) {
+  constructor(scope: Construct, id: string, { api, tenants, sharingTable, jwtSecret, environment }: PostEditorProps) {
     super(scope, id);
 
     const drafts = new Table(this, "Drafts", {
@@ -81,6 +82,7 @@ export class PostEditor extends Construct {
       timeout: Duration.seconds(20),
       environment: {
         ...common.environment,
+        ...(sharingTable ? { SITE_SHARING_TABLE: sharingTable.tableName } : {}),
         SCHEDULE_GROUP: group.ref,
         SCHEDULE_ROLE: delivery.roleArn,
         QUEUE_URL: queue.queueUrl,
@@ -99,6 +101,13 @@ export class PostEditor extends Construct {
       jwtSecret.grantRead(handler);
     }
     media.grantReadWrite(editor);
+    if (sharingTable) {
+      editor.addToRolePolicy(new PolicyStatement({
+        actions: ["dynamodb:GetItem"],
+        resources: [sharingTable.tableArn],
+        conditions: { "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["SITE_SHARING#*"] } },
+      }));
+    }
     media.grantRead(worker);
     queue.grantSendMessages(editor);
     worker.addEventSource(new SqsEventSource(queue, { batchSize: 1, maxConcurrency: 2 }));

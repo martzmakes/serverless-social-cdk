@@ -20,9 +20,9 @@ export async function loadAppJwtKey(): Promise<Uint8Array> {
   return cachedKey;
 }
 
-export async function mintJwt(email: string): Promise<string> {
+export async function mintJwt(email: string, siteHost?: string): Promise<string> {
   const key = await loadAppJwtKey();
-  return await new SignJWT({})
+  return await new SignJWT(siteHost ? { siteHost } : {})
     .setProtectedHeader({ alg: "HS256" })
     .setSubject(email)
     .setIssuedAt()
@@ -32,7 +32,7 @@ export async function mintJwt(email: string): Promise<string> {
     .sign(key);
 }
 
-export async function verifyJwt(token: string): Promise<{ email: string }> {
+export async function verifyJwt(token: string): Promise<{ email: string; siteHost?: string }> {
   const key = await loadAppJwtKey();
   const { payload } = await jwtVerify(token, key, {
     issuer: ISSUER,
@@ -41,5 +41,5 @@ export async function verifyJwt(token: string): Promise<{ email: string }> {
   if (typeof payload.sub !== "string" || !payload.sub) {
     throw new Error("JWT missing subject");
   }
-  return { email: payload.sub };
+  return { email: payload.sub, ...(typeof payload.siteHost === "string" ? { siteHost: payload.siteHost } : {}) };
 }

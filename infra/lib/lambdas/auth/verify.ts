@@ -251,6 +251,7 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
     }
   }
 
-  const jwt = await mintJwt(email);
-  return successPage(jwt, resolveSiteUrl(tokenRow.Item.originHost, SITE_URL));
+  const siteUrl = resolveSiteUrl(tokenRow.Item.originHost, SITE_URL);
+  const jwt = await mintJwt(email, new URL(siteUrl).hostname);
+  return successPage(jwt, siteUrl);
 };

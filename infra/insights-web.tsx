@@ -1,8 +1,11 @@
-import { useEffect, useRef, useState, type CSSProperties, type FormEvent } from "react";
+export { ArticleReplyQueue } from "./reply-queue-web";
+export { SiteSharingSettings } from "./site-sharing-web";
+import { ReplyItem } from "./article-reply-web";
+import { useEffect, useState, type CSSProperties } from "react";
 import {
   DEVICES, SHARE_SOURCES, SOURCES, taggedArticleUrl,
   type ArticleDistribution, type ArticleInsights, type ArticleReplies, type ArticleReply,
-  type InsightArticle, type InsightDays, type InsightSite, type InsightsClient, type ReplySubmission,
+  type InsightArticle, type InsightDays, type InsightSite, type InsightsClient,
 } from "./insights";
 
 const number = new Intl.NumberFormat();
@@ -296,82 +299,6 @@ function ArticleConversation({ client, site, rkey }: { client: InsightsClient; s
         <p>{showHandled ? "No handled replies to display." : "No open replies to display."}</p>}
       {data?.next && !failed && <button type="button" disabled={loading} onClick={() => setAfter(data.next)}>Load older Fediverse replies</button>}
     </details>
-  );
-}
-
-function ReplyItem({ reply, site, client, rkey, composing, onCompose, onHandled }: {
-  reply: ArticleReply; site: InsightSite; client: InsightsClient; rkey: string; composing: boolean;
-  onCompose: (active: boolean) => void; onHandled: (handled: boolean) => void;
-}) {
-  const [text, setText] = useState("");
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState("");
-  const [receipt, setReceipt] = useState<ReplySubmission>();
-  const submission = useRef<{ text: string; id: string }>(undefined);
-
-  async function send(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const normalized = text.trim();
-    if (!normalized || pending) return;
-    setPending(true);
-    setError("");
-    try {
-      const intent = submission.current?.text === normalized ? submission.current : { text: normalized, id: crypto.randomUUID() };
-      submission.current = intent;
-      const result = await client.sendReply(site.did, rkey, reply, intent.text, intent.id);
-      setReceipt(result);
-      setText("");
-      submission.current = undefined;
-      onCompose(false);
-    } catch (reason) {
-      setError(message(reason));
-    } finally {
-      setPending(false);
-    }
-  }
-
-  async function changeStatus() {
-    if (pending) return;
-    setPending(true);
-    setError("");
-    try {
-      const result = await client.setReplyHandled(site.did, rkey, reply, !reply.handled);
-      onHandled(result.handled);
-    } catch (reason) {
-      setError(message(reason));
-    } finally {
-      setPending(false);
-    }
-  }
-
-  return (
-    <li style={{ marginBlock: "1rem" }}>
-      <strong>{reply.author}</strong> · <span>{reply.network}</span>
-      <p style={{ whiteSpace: "pre-wrap", marginBlock: ".35rem" }}>{reply.text}</p>
-      <div style={layout}>
-        <a href={reply.url}>Open reply on {reply.network}</a>
-        {!composing && <button type="button" disabled={pending} onClick={() => { setError(""); onCompose(true); }}>Reply</button>}
-        <button type="button" disabled={pending} onClick={() => void changeStatus()}>{reply.handled ? "Reopen" : "Mark handled"}</button>
-      </div>
-      {composing && (
-        <form onSubmit={send} style={{ marginBlock: ".75rem" }}>
-          <label style={field}>Reply as @{site.handle} on {reply.network}
-            <textarea rows={3} style={{ ...control, resize: "vertical" }} value={text} maxLength={3000}
-              onChange={event => setText(event.target.value)} disabled={pending} />
-          </label>
-          <small>Up to 300 characters.</small>
-          <div style={{ ...layout, marginBlock: ".5rem" }}>
-            <button type="submit" disabled={pending || !text.trim()}>{pending ? "Sending…" : "Send public reply"}</button>
-            <button type="button" disabled={pending} onClick={() => { setError(""); onCompose(false); }}>Cancel</button>
-          </div>
-        </form>
-      )}
-      {error && <p role="alert">{error}</p>}
-      {receipt && <p role="status">
-        {receipt.status === "queued" ? "Queued for delivery." : "Reply sent."}{' '}
-        <a href={receipt.url}>Open your reply</a>
-      </p>}
-    </li>
   );
 }
 

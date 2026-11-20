@@ -20,6 +20,7 @@ try {
     path.join(workspace, packed.filename),
     `aws-cdk-lib@${require("aws-cdk-lib/package.json").version}`,
     `constructs@${require("constructs/package.json").version}`,
+    `react@${require("react/package.json").version}`,
   ], { cwd: workspace, stdio: "inherit" });
 
   fs.copyFileSync(path.join(__dirname, "package-consumer.cjs"), path.join(workspace, "app.cjs"));
