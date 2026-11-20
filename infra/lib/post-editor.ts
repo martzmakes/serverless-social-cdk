@@ -8,7 +8,7 @@ import { SqsEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
 import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
 import { BlockPublicAccess, Bucket, BucketEncryption } from "aws-cdk-lib/aws-s3";
 import { CfnScheduleGroup } from "aws-cdk-lib/aws-scheduler";
-import { Queue, QueueEncryption } from "aws-cdk-lib/aws-sqs";
+import { Queue, QueueEncryption, type IQueue } from "aws-cdk-lib/aws-sqs";
 import type { IStringParameter } from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 import { lambdaSource } from "./lambda-assets";
@@ -22,6 +22,8 @@ export interface PostEditorProps {
 }
 
 export class PostEditor extends Construct {
+  private readonly editor: NodejsFunction;
+  private readonly worker: NodejsFunction;
   constructor(scope: Construct, id: string, { api, tenants, sharingTable, jwtSecret, environment }: PostEditorProps) {
     super(scope, id);
 
@@ -76,7 +78,7 @@ export class PostEditor extends Construct {
         XRPC_ORIGIN: api.apiEndpoint,
       },
     };
-    const editor = new NodejsFunction(this, "Api", {
+    const editor = this.editor = new NodejsFunction(this, "Api", {
       ...common,
       ...lambdaSource("editor/handler"),
       timeout: Duration.seconds(20),
@@ -90,9 +92,13 @@ export class PostEditor extends Construct {
         DEAD_LETTER_ARN: deadLetter.queueArn,
       },
     });
-    const worker = new NodejsFunction(this, "Publish", {
+    const worker = this.worker = new NodejsFunction(this, "Publish", {
       ...common,
       ...lambdaSource("editor/worker"),
+      environment: {
+        ...common.environment,
+        ...(sharingTable ? { SITE_SHARING_TABLE: sharingTable.tableName } : {}),
+      },
       timeout: Duration.seconds(45),
     });
     for (const handler of [editor, worker]) {
@@ -102,7 +108,7 @@ export class PostEditor extends Construct {
     }
     media.grantReadWrite(editor);
     if (sharingTable) {
-      editor.addToRolePolicy(new PolicyStatement({
+      for (const handler of [editor, worker]) handler.addToRolePolicy(new PolicyStatement({
         actions: ["dynamodb:GetItem"],
         resources: [sharingTable.tableArn],
         conditions: { "ForAllValues:StringLike": { "dynamodb:LeadingKeys": ["SITE_SHARING#*"] } },
@@ -127,5 +133,19 @@ export class PostEditor extends Construct {
         integration: new HttpLambdaIntegration(path.endsWith("}") ? "EditorActions" : "EditorHome", editor),
       });
     }
+  }
+
+  configureLaunches({ index, apRetryQueue, apCustomHosts }: { index: ITable; apRetryQueue: IQueue; apCustomHosts: string }) {
+    for (const handler of [this.editor, this.worker]) {
+      handler.addEnvironment("LONGFORM_INDEX_TABLE", index.tableName);
+      handler.addEnvironment("AP_LAUNCH_QUEUE_URL", apRetryQueue.queueUrl);
+      handler.addEnvironment("AP_CUSTOM_HOSTS", apCustomHosts);
+    }
+    index.grantReadData(this.editor);
+    this.worker.addToRolePolicy(new PolicyStatement({
+      actions: ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+      resources: [index.tableArn],
+    }));
+    apRetryQueue.grantSendMessages(this.worker);
   }
 }

@@ -12,7 +12,7 @@ import { articleRepliesPartition, type TimelineItem } from "../ap/ingest";
 import { safeHttpsUrl } from "../ap/sanitize";
 import { canonicalApOrigin, parseCustomHosts } from "../ap/host";
 import { applyReplyAction, blueskyLink, readHandled, readReplyAction, ReplyActionError } from "./reply-actions";
-import type { IndexItem } from "../pds/longform-index";
+import { articleFromIndexRow, type IndexItem } from "../pds/longform-index";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const s3 = new S3Client({});
@@ -230,7 +230,7 @@ async function replyQueue(site: InsightSite, pk: string, after?: string): Promis
   // uses the same two live sources and state as an individual conversation.
   const page = await articleIndexPage(pk, 8, after);
   const threads = await Promise.all((page.Items ?? []).flatMap(row => {
-    const item = row.item as IndexItem | undefined;
+    const item = articleFromIndexRow(row);
     const article = getArticle(item, site);
     if (!item || !article) return [];
     return [(async () => {
@@ -368,7 +368,7 @@ export async function handler(event: APIGatewayProxyEventV2) {
       if (path === `${base}/replies`) return json(200, await replyQueue(site, pk, params.after));
       const result = await articleIndexPage(pk, 30, params.after);
       const articles = (result.Items ?? []).flatMap(row => {
-        const article = getArticle(row.item, site);
+        const article = getArticle(articleFromIndexRow(row), site);
         return article ? [article] : [];
       });
       return json(200, { articles, next: result.LastEvaluatedKey?.sk });
@@ -381,7 +381,7 @@ export async function handler(event: APIGatewayProxyEventV2) {
     if (!isDistribution && !isReplies && !["7", "30", "90"].includes(days)) return json(400, { message: "Select 7, 30, or 90 days." });
 
     const result = await ddb.send(new GetCommand({ TableName: indexTable, Key: { pk, sk: rkey }, ConsistentRead: true }));
-    const item = result.Item?.item as IndexItem | undefined;
+    const item = articleFromIndexRow(result.Item);
     const article = getArticle(item, site);
     if (!item || !article) return json(404, { message: "This article is unavailable." });
     if (isReplies) {

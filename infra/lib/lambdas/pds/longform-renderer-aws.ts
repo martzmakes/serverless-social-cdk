@@ -9,22 +9,22 @@
 // @aws-sdk/signature-v4a declares "sideEffects": true, so esbuild will not
 // tree-shake this import. Referencing the binding is belt-and-suspenders.
 import * as __sigv4a from '@aws-sdk/signature-v4a'
-import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3'
+import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3'
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
-import { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb'
+import { DynamoDBDocumentClient, GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb'
+import { articleFromIndexRow } from './longform-index'
 import { CloudFrontKeyValueStoreClient, PutKeyCommand, DeleteKeyCommand, DescribeKeyValueStoreCommand } from '@aws-sdk/client-cloudfront-keyvaluestore'
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm'
-import type { Ports, RenderEvent, TenantScope } from './longform-renderer'
+import type { DiscussionPorts, ManagedBlueskyEvent, Ports, RenderEvent, TenantScope } from './longform-renderer'
 import type { RenderCtx } from './longform-render'
 import { makeSession, makeSessionFor } from './session'
 import { ENV } from './lexicons'
-import * as lex from './lexicons'
 import { resolveTenant, apexTenant, type TenantStore } from './tenant'
 import { APEX_DID } from './tenant-keys'
 import { renderTargetForTenant, type RenderTarget } from './longform-tenant'
 import { prepareCoverPreview } from './cover-preview'
 
-const COLL = ((lex as any).LONGFORM_COLLECTION as string) || 'social.serverless.longform'
+const COLL = 'social.serverless.longform'
 
 /** Apex deploy-env config — the SINGLE source for apex render identity.
  *  Threaded into renderTargetForTenant so apex → byte-identical to the
@@ -129,6 +129,27 @@ export function eventsFromStream(event: { Records: any[] }): RenderEvent[] {
   return evs
 }
 
+/** Ignore ordinary index updates, including edits that retain the same post. */
+export function managedBlueskyEventsFromStream(event: { Records: any[] }): ManagedBlueskyEvent[] {
+  const launches: ManagedBlueskyEvent[] = []
+  for (const stream of event.Records ?? []) {
+    if (stream.eventName !== 'MODIFY') continue
+    const key = stream.dynamodb?.Keys
+    const pk = key?.pk?.S
+    const rkey = key?.sk?.S
+    if (typeof pk !== 'string' || typeof rkey !== 'string' || !rkey) continue
+    const did = pk === 'IDX' ? APEX_DID : pk.startsWith('IDX#did:') ? pk.slice(4) : undefined
+    const next = stream.dynamodb.NewImage?.launchBluesky?.M
+    const previous = stream.dynamodb.OldImage?.launchBluesky?.M
+    const uri = next?.uri?.S
+    const cid = next?.cid?.S
+    if (did && typeof uri === 'string' && typeof cid === 'string' &&
+      uri.startsWith(`at://${did}/app.bsky.feed.post/`) &&
+      (uri !== previous?.uri?.S || cid !== previous?.cid?.S)) launches.push({ rkey, did, syndication: { uri, cid } })
+  }
+  return launches
+}
+
 // --- auth: mint+cache an accessJwt the SAME way the existing PDS write path does ---
 // Mirrors handler.ts: getJwtSecret() loads from SSM SecureString at ENV.JWT_SECRET_PARAM,
 // then calls makeSession(secret) from session.ts and caches the .accessJwt.
@@ -174,7 +195,7 @@ async function accessJwt(scope?: TenantScope): Promise<string> {
   return session.accessJwt
 }
 
-export function makeAwsPorts(): Ports {
+export function makeAwsPorts(): Ports & DiscussionPorts {
   // Force-retain the SigV4a registration side-effect import (see top of file).
   // Touching the namespace guarantees esbuild keeps the module + its
   // signatureV4aContainer.SignatureV4a assignment in the bundle.
@@ -248,17 +269,32 @@ export function makeAwsPorts(): Ports {
     async putObject(key, body, contentType) {
       await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: contentType, CacheControl: 'public, max-age=60' }))
     },
+    async readArticle(path) {
+      const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: path }));
+      if (!response.Body || !response.ETag) throw new Error('Managed article object is unavailable');
+      return { html: await response.Body.transformToString(), etag: response.ETag };
+    },
+    async updateArticle(path, html, etag) {
+      await s3.send(new PutObjectCommand({
+        Bucket: bucket, Key: path, Body: html, IfMatch: etag,
+        ContentType: 'text/html; charset=utf-8', CacheControl: 'public, max-age=60',
+      }));
+    },
     async deleteObject(key) { await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key })) },
     async listIndex(scope) {
       const out = await ddb.send(new QueryCommand({ TableName: table, KeyConditionExpression: 'pk = :p', ExpressionAttributeValues: { ':p': idxPk(scope) } }))
-      return (out.Items || []).map(i => i.item)
+      return (out.Items || []).flatMap(row => articleFromIndexRow(row) ?? [])
     },
     async getIndex(rkey, scope) {
-      const out = await ddb.send(new GetCommand({ TableName: table, Key: { pk: idxPk(scope), sk: rkey } }))
-      return out.Item?.item
+      const out = await ddb.send(new GetCommand({ TableName: table, Key: { pk: idxPk(scope), sk: rkey }, ConsistentRead: true }))
+      return articleFromIndexRow(out.Item)
     },
     async putIndex(item, scope) {
-      await ddb.send(new PutCommand({ TableName: table, Item: { pk: idxPk(scope), sk: item.rkey, item } }))
+      await ddb.send(new UpdateCommand({
+        TableName: table, Key: { pk: idxPk(scope), sk: item.rkey },
+        UpdateExpression: 'SET #item = :item', ExpressionAttributeNames: { '#item': 'item' },
+        ExpressionAttributeValues: { ':item': item },
+      }))
     },
     async ownerOf(slug, scope) {
       const out = await ddb.send(new QueryCommand({ TableName: table, KeyConditionExpression: 'pk = :p', ExpressionAttributeValues: { ':p': idxPk(scope) } }))

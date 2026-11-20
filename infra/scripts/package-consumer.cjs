@@ -7,8 +7,17 @@ const { HostedZone } = require("aws-cdk-lib/aws-route53");
 const { ServerlessSocialStack, ServerlessSocialSite } = require("@martzmakes/serverless-social");
 const { ArticleReplyQueue } = require("@martzmakes/serverless-social/insights-web");
 const { createInsightsClient } = require("@martzmakes/serverless-social/insights");
+const { createDirectMessagesClient } = require("@martzmakes/serverless-social/direct-messages");
+const { DirectMessages } = require("@martzmakes/serverless-social/direct-messages-web");
+const { createFediverseMessagesClient } = require("@martzmakes/serverless-social/fediverse-messages");
+const { FediverseMessages } = require("@martzmakes/serverless-social/fediverse-messages-web");
+const { createLaunchesClient } = require("@martzmakes/serverless-social/launches");
+const { ArticleLaunches } = require("@martzmakes/serverless-social/launches-web");
 assert.equal(typeof ArticleReplyQueue, "function");
 assert.equal(typeof createInsightsClient({ origin: "https://social.example.com", token: () => null }).replyQueue, "function");
+for (const value of [createDirectMessagesClient, DirectMessages, createFediverseMessagesClient, FediverseMessages, createLaunchesClient, ArticleLaunches]) {
+  assert.equal(typeof value, "function");
+}
 
 const env = { account: "123456789012", region: "us-east-1" };
 const context = {
@@ -34,7 +43,7 @@ new ServerlessSocialStack(app, "ExistingFirehose", {
   firehose: { mode: "existing", hostname: "firehose.example.com", instanceId: "example-repo" },
 });
 new ServerlessSocialStack(app, "Editor", {
-  ...props, editor: true,
+  ...props, editor: true, directMessages: true,
   firehose: { mode: "existing", hostname: "firehose.example.com", instanceId: "editor-test" },
 });
 const site = new Stack(app, "ExistingPds", { env });
@@ -78,6 +87,27 @@ assert.equal(resources("ExistingFirehose", "AWS::EC2::Instance").length, 0);
 const editorTargets = resources("Editor", "AWS::ApiGatewayV2::Route").map(route => route.RouteKey);
 assert.ok(editorTargets.includes("GET /auth/editor"));
 assert.ok(editorTargets.includes("PUT /auth/editor/{proxy+}"));
+const messageRoutes = [
+  "GET /auth/messages",
+  "POST /auth/messages/conversations",
+  "GET /auth/messages/conversations/{conversationId}",
+  "POST /auth/messages/conversations/{conversationId}",
+  "GET /auth/fediverse-messages",
+  "POST /auth/fediverse-messages",
+];
+for (const route of messageRoutes) assert.ok(editorTargets.includes(route));
+assert.equal(resources("Standalone", "AWS::ApiGatewayV2::Route")
+  .filter(route => messageRoutes.includes(route.RouteKey)).length, 0);
+const privateMessagesTable = Object.entries(assembly.getStackByName("Editor").template.Resources)
+  .find(([id, resource]) => id.startsWith("ApPrivateMessages") && resource.Type === "AWS::DynamoDB::Table")?.[1];
+assert.equal(privateMessagesTable?.Properties.BillingMode, "PAY_PER_REQUEST");
+assert.ok(privateMessagesTable && !privateMessagesTable.Properties.StreamSpecification);
+assert.equal(privateMessagesTable.DeletionPolicy, "Retain");
+const launchRender = resources("Editor", "AWS::Lambda::EventSourceMapping").find(mapping =>
+  mapping.FilterCriteria?.Filters.some(filter => filter.Pattern.includes("launchBluesky")));
+assert.equal(launchRender?.StartingPosition, "TRIM_HORIZON");
+assert.equal(resources("Standalone", "AWS::Lambda::EventSourceMapping").some(mapping =>
+  mapping.FilterCriteria?.Filters.some(filter => filter.Pattern.includes("launchBluesky"))), false);
 assert.equal(resources("Editor", "AWS::Scheduler::ScheduleGroup").length, 1);
 assert.equal(resources("Editor", "AWS::EC2::Instance").length, 0);
 assert.equal(resources("Standalone", "AWS::Scheduler::ScheduleGroup").length, 0);
@@ -105,7 +135,13 @@ assert.deepEqual(apiOrigin.OriginCustomHeaders, [
   { HeaderName: "x-pds-viewer-host", HeaderValue: "example.net" },
 ]);
 const router = resources("ExistingPds", "AWS::CloudFront::Function")[0].FunctionCode;
-for (const [uri, expected] of [["/profile/admin", "/index.html"], ["/auth/complete", "/index.html"], ["/assets/logo.png", "/assets/logo.png"]]) {
+for (const [uri, expected] of [
+  ["/profile/admin", "/index.html"],
+  ["/auth/complete", "/index.html"],
+  ["/following/messages", "/index.html"],
+  ["/compose/launches", "/index.html"],
+  ["/assets/logo.png", "/assets/logo.png"],
+]) {
   const event = { request: { uri } };
   assert.equal(vm.runInNewContext(`${router}\nhandler(event)`, { event }).uri, expected);
 }

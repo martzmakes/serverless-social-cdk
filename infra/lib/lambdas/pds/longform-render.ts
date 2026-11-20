@@ -12,6 +12,7 @@ import sql from 'highlight.js/lib/languages/sql'
 import { sanitizeWithProfile, attr, type SanitizeProfile } from '../ap/sanitize'
 import { canonicalApHost } from '../ap/host'
 import { absoluteImageUrl, shareImageTags, type CoverPreview } from './longform-preview'
+import { normalizeVideoCompanion, type VideoCompanion } from '../../../youtube'
 
 export interface LongformContent {
   title: string
@@ -24,6 +25,8 @@ export interface LongformContent {
   /** Published cover image URL and optional author-provided description. */
   coverImage?: string
   coverImageAlt?: string
+  video?: VideoCompanion
+  managedLaunch?: boolean
   /**
    * Spec #5d Task 10: when the longform was syndicated to Bluesky as a short
    * post, the renderer emits an inline comments widget (read-only) that
@@ -94,6 +97,26 @@ export interface RelatedCandidate {
 
 const htmlEscape = (s: string): string =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+
+export const VIDEO_COMPANION_CSS = `
+.video-companion{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;
+  gap:12px 24px;margin:32px 0;padding:16px 20px;border:1px solid currentColor;
+  border-color:color-mix(in srgb,currentColor 24%,transparent);border-radius:12px;
+  background:color-mix(in srgb,currentColor 4%,transparent)}
+.video-companion__label{display:block;font-size:.82rem;line-height:1.4}
+.video-companion__title{display:block;margin-top:.25rem;overflow-wrap:anywhere}
+.video-companion a{display:inline-flex;align-items:center;gap:.35em;min-height:44px;font-weight:600}
+.video-companion a:focus-visible{outline:2px solid currentColor;outline-offset:4px;border-radius:2px}
+`
+
+export function renderVideoCompanion(input: unknown): string {
+  const video = normalizeVideoCompanion(input)
+  if (!video) return ''
+  return `<aside class="video-companion" aria-label="Video companion">
+<div><span class="video-companion__label">Video companion</span>${video.title ? `<strong class="video-companion__title">${htmlEscape(video.title)}</strong>` : ''}</div>
+<a href="${htmlEscape(video.url)}" target="_blank" rel="noopener noreferrer" aria-label="Watch on YouTube (opens in a new tab)">Watch on YouTube <span aria-hidden="true">↗</span></a>
+</aside>`
+}
 
 // ─── Accent + read-time helpers (martzmakes-layout-spec.md) ──────────────────
 
@@ -512,13 +535,13 @@ function buildMetaRow(rec: LongformContent, strippedContent: string, origin: str
     )
   }
 
-  if (rec.syndication?.bsky?.uri) {
+  if (!rec.managedLaunch && rec.syndication?.bsky?.uri) {
     items.push('syndicated to bluesky')
   }
 
   return `<div class="meta-row">${items
     .map((item, i) => (i === 0 ? item : `<span class="mdot" aria-hidden="true">·</span>${item}`))
-    .join('')}</div>`
+    .join('')}${rec.managedLaunch ? managedRegion('meta', managedBlueskyMeta(!!rec.syndication?.bsky?.uri)) : ''}</div>`
 }
 
 /**
@@ -860,7 +883,7 @@ const atUriRkey = (uri: string): string => {
 /** Spec #5d Task 10: build the comments section HTML when a syndication target
  *  exists. Returns the empty string otherwise — the apex byte-lock requires
  *  the non-syndicated render to be byte-identical. */
-function renderCommentsSection(rec: LongformContent, ctx: RenderCtx): string {
+function renderCommentsSection(rec: Pick<LongformContent, 'syndication' | 'authorHandle'>, ctx: RenderCtx): string {
   const syn = rec.syndication?.bsky
   if (!syn || !syn.uri) return ''
   const threadUri = htmlEscape(syn.uri)
@@ -900,6 +923,24 @@ ${ctaHtml}
 }
 
 
+
+function managedRegion(name: 'comments' | 'meta', html: string) {
+  return `<!-- ss:launch-${name}:start -->${html}<!-- ss:launch-${name}:end -->`
+}
+
+function managedBlueskyMeta(linked: boolean) {
+  return linked ? '<span class="mdot" aria-hidden="true">·</span>syndicated to bluesky' : ''
+}
+
+/** Replace only the renderer-owned mounts within a managed article. */
+export function patchManagedBluesky(html: string, bsky: NonNullable<NonNullable<LongformContent['syndication']>['bsky']>, ctx: RenderCtx): string {
+  const meta = /<!-- ss:launch-meta:start -->[\s\S]*?<!-- ss:launch-meta:end -->/
+  const comments = /<!-- ss:launch-comments:start -->[\s\S]*?<!-- ss:launch-comments:end -->/
+  if (!meta.test(html) || !comments.test(html)) throw new Error('Managed article mounts are unavailable')
+  return html
+    .replace(meta, () => managedRegion('meta', managedBlueskyMeta(true)))
+    .replace(comments, () => managedRegion('comments', renderCommentsSection({ syndication: { bsky }, authorHandle: ctx.author }, ctx)))
+}
 
 /** Task 15: author card (profile + follow links) and related posts. */
 function renderEndMatter(rec: LongformContent, ctx: RenderCtx): string {
@@ -968,6 +1009,7 @@ export function renderArticleHtml(rec: LongformContent, ctx: RenderCtx): string 
   const profileHref = `${safeOrigin}/profile/${encodeURIComponent(ctx.author)}`
   const metaRowHtml = buildMetaRow(rec, strippedContent, ctx.origin)
   const endMatter = renderEndMatter(rec, ctx)
+  const videoHtml = renderVideoCompanion(rec.video)
   const jsonLd = JSON.stringify({
     '@context': 'https://schema.org',
     '@type': 'BlogPosting',
@@ -984,7 +1026,9 @@ export function renderArticleHtml(rec: LongformContent, ctx: RenderCtx): string 
   // Spec #5d Task 10: comments widget. Returns '' when not syndicated → apex
   // byte-lock: a non-syndicated render is byte-identical to the pre-T10 output.
   const commentsHtml = renderCommentsSection(rec, ctx)
-  const commentsBlock = commentsHtml ? `\n${commentsHtml}` : ''
+  const commentsBlock = rec.managedLaunch
+    ? managedRegion('comments', commentsHtml)
+    : commentsHtml ? `\n${commentsHtml}` : ''
   return `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -1010,7 +1054,7 @@ ${imageTags.twitter}
 <link rel="preconnect" href="https://api.fontshare.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&amp;display=swap">
 <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=general-sans@400,500,600,700&amp;display=swap">
-<style>${BRAND_CSS}</style>
+<style>${BRAND_CSS}${videoHtml ? VIDEO_COMPANION_CSS : ''}</style>
 <script type="application/ld+json">${jsonLdSafe(jsonLd)}</script>
 </head><body>
 <header class="site-header"><div class="wrap">
@@ -1025,7 +1069,7 @@ ${imageTags.twitter}
 <main><div class="wrap"><article>
 <h1>${htmlEscape(rec.title)}</h1>
 ${metaRowHtml}
-${mdToSafeHtml(strippedContent)}
+${mdToSafeHtml(strippedContent)}${videoHtml ? `\n${videoHtml}` : ''}
 ${endMatter}
 ${commentsBlock}
 </article></div></main>

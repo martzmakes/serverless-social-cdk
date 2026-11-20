@@ -1,4 +1,6 @@
 /** Typed client for the optional editor on a Serverless Social deployment. */
+import type { VideoCompanion } from "./youtube";
+
 export type PostKind = "post" | "longform";
 export type DraftFields = {
   content: string;
@@ -9,6 +11,8 @@ export type DraftFields = {
   teaser: string;
   syndicate: boolean;
   images: { id: string; alt: string }[];
+  video?: VideoCompanion;
+  managedLaunch?: boolean;
 };
 
 export type EditorDraft = {

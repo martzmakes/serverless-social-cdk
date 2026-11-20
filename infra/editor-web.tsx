@@ -1,8 +1,9 @@
 export { PublishingCalendar } from "./publishing-calendar-web";
 import {
-  useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode,
+  useCallback, useEffect, useId, useRef, useState, type CSSProperties, type ReactNode,
 } from "react";
 import { createEditorClient, draftMarkdown, insertDraftImage, type DraftFields, type DraftSummary, type EditorDraft, type PostKind } from "./editor";
+import { normalizeVideoCompanion, videoTitleLimit } from "./youtube";
 
 type Client = ReturnType<typeof createEditorClient>;
 type Published = Awaited<ReturnType<Client["published"]>>["posts"];
@@ -14,6 +15,7 @@ export interface PostEditorProps {
   initialDraftId?: string;
   onDirtyChange?: (dirty: boolean) => void;
   onPublished?: (post: NonNullable<EditorDraft["result"]>, kind: PostKind) => void;
+  onPlanLaunch?: (post: NonNullable<EditorDraft["result"]>) => void;
   renderMarkdown?: (source: string) => ReactNode;
   accent?: string;
 }
@@ -33,15 +35,25 @@ const css = `
 .ss-editor a{color:var(--ss-editor-accent,#77aaff)}.ss-editor small,.ss-editor .ss-muted{color:#aeb8cb}
 .ss-editor [role=alert]{color:#ff9d9d}.ss-editor img{max-width:100%;max-height:16rem;object-fit:contain;border-radius:.5rem}
 .ss-editor .ss-asset,.ss-editor .ss-preview{padding:1rem;border:1px solid #354157;border-radius:.6rem;margin:1rem 0}
+.ss-editor .ss-video{margin:1.2rem 0}
+.ss-editor .ss-video h2{margin-bottom:.25rem}
+.ss-editor .ss-video-preview{margin-top:1rem;padding:1rem;border:1px solid #354157;border-radius:.5rem}
+.ss-editor .ss-video-preview strong,.ss-editor .ss-video-preview a{display:block}
 .ss-editor .ss-item{width:100%;text-align:left;margin:.25rem 0;overflow-wrap:anywhere}
 .ss-editor .ss-status{min-height:1.5em}.ss-editor .ss-preview{overflow-wrap:anywhere}.ss-editor .ss-plain{white-space:pre-wrap}
 `;
 
 /** Reusable authoring UI for a web app that already supplies an authenticated editor client. */
-export function PostEditor({ client, identity, initialKind = "post", initialDraftId, onDirtyChange, onPublished, renderMarkdown, accent }: PostEditorProps) {
+export function PostEditor({ client, identity, initialKind = "post", initialDraftId, onDirtyChange, onPublished, onPlanLaunch, renderMarkdown, accent }: PostEditorProps) {
   const [draft, setDraft] = useState<EditorDraft>();
   const [fields, setFields] = useState<DraftFields>();
   const [tagText, setTagText] = useState("");
+  const [videoUrl, setVideoUrl] = useState("");
+  const [videoTitle, setVideoTitle] = useState("");
+  const [videoTouched, setVideoTouched] = useState(false);
+  const videoFieldId = useId();
+  const validVideo = normalizeVideoCompanion({ url: videoUrl, title: videoTitle });
+  const invalidVideo = draft?.kind === "longform" && !!videoUrl.trim() && !validVideo;
   const [drafts, setDrafts] = useState<DraftSummary[]>([]);
   const [published, setPublished] = useState<Published>([]);
   const [tab, setTab] = useState<"drafts" | "published">("drafts");
@@ -58,7 +70,7 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
   const bodyCursor = useRef<number>(undefined);
   const queue = useRef<Promise<void>>(Promise.resolve());
   const foreground = useRef(false);
-  const hasUnsavedChanges = !!draft && !!fields && fields !== draft.fields;
+  const hasUnsavedChanges = !!draft && !!fields && (fields !== draft.fields || invalidVideo);
   useEffect(() => { onDirtyChange?.(hasUnsavedChanges); }, [hasUnsavedChanges, onDirtyChange]);
 
   const showError = (reason: unknown) => setError(reason instanceof Error ? reason.message : "The editor is unavailable.");
@@ -69,6 +81,9 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
     setDraft(next);
     setFields(next?.fields);
     setTagText(next?.fields.tags.join(", ") ?? "");
+    setVideoUrl(next?.fields.video?.url ?? "");
+    setVideoTitle(next?.fields.video?.title ?? "");
+    setVideoTouched(false);
     setPreview(false);
     setCopied(false);
     setScheduleAt("");
@@ -139,11 +154,11 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
   }, [draft, fields, busy, flush, serialize]);
 
   useEffect(() => {
-    if (!draft || !fields || fields === draft.fields) return;
+    if (!hasUnsavedChanges) return;
     const guard = (event: BeforeUnloadEvent) => event.preventDefault();
     window.addEventListener("beforeunload", guard);
     return () => window.removeEventListener("beforeunload", guard);
-  }, [draft, fields]);
+  }, [hasUnsavedChanges]);
 
   useEffect(() => {
     if (!draft || (draft.state !== "publishing" && draft.state !== "scheduled")) return;
@@ -171,6 +186,13 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
     latest.current = { ...latest.current, fields: next };
     setFields(next);
     setError(undefined);
+  }
+
+  function changeVideo(url: string, title: string) {
+    const next = normalizeVideoCompanion({ url, title });
+    if (url.trim() && !next) return;
+    const previous = latest.current.fields?.video;
+    if (previous?.url !== next?.url || previous?.title !== next?.title) change({ video: next });
   }
 
   function run(action: () => Promise<void>) {
@@ -257,6 +279,9 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
       {draft.state === "published" && draft.result && (
         <button className="ss-primary" type="button" onClick={() => onPublished?.(draft.result!, draft.kind)}>View published {label}</button>
       )}
+      {draft.state === "published" && draft.result && draft.fields.managedLaunch && onPlanLaunch && (
+        <button type="button" onClick={() => onPlanLaunch(draft.result!)}>Plan social launch</button>
+      )}
       {!locked && <fieldset disabled={busy}>
         {longform && <>
           <label>Title<input value={fields.title} onChange={event => change({ title: event.target.value })} /></label>
@@ -272,6 +297,38 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
           onSelect={event => { bodyCursor.current = event.currentTarget.selectionEnd; }} />
         </label>
         {!longform && <small>{[...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(fields.content)].length}/300 characters</small>}
+        {longform && <section className="ss-video" aria-labelledby={`${videoFieldId}-title`}>
+          <h2 id={`${videoFieldId}-title`}>Video companion</h2>
+          <small id={`${videoFieldId}-help`}>Optional. Readers open the video on YouTube.</small>
+          <label>YouTube video link
+            <input type="url" value={videoUrl} placeholder="https://youtu.be/…" maxLength={2048} autoComplete="off"
+              aria-describedby={`${videoFieldId}-help${invalidVideo && videoTouched ? ` ${videoFieldId}-error` : ""}`}
+              aria-invalid={invalidVideo && videoTouched ? true : undefined}
+              onChange={event => {
+                const url = event.currentTarget.value;
+                setVideoUrl(url);
+                changeVideo(url, videoTitle);
+              }}
+              onBlur={() => {
+                setVideoTouched(true);
+                if (validVideo) setVideoUrl(validVideo.url);
+              }} />
+          </label>
+          {invalidVideo && videoTouched && <p id={`${videoFieldId}-error`} role="alert">Enter an HTTPS link to a YouTube video or clear this field.</p>}
+          {validVideo && <label>Video title (optional)
+            <input value={videoTitle} maxLength={videoTitleLimit} onChange={event => {
+              const title = event.currentTarget.value;
+              setVideoTitle(title);
+              changeVideo(videoUrl, title);
+            }} />
+          </label>}
+          {(videoUrl || fields.video) && <button type="button" onClick={() => {
+            setVideoUrl("");
+            setVideoTitle("");
+            setVideoTouched(false);
+            changeVideo("", "");
+          }}>Remove video</button>}
+        </section>}
         <div className="ss-row">
           <button type="button" aria-pressed={preview} onClick={() => setPreview(!preview)}>{preview ? "Hide preview" : "Preview"}</button>
           <button type="button" disabled={!dirty} onClick={() => run(async () => { await flush(); })}>Save draft</button>
@@ -279,6 +336,11 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
         {preview && <div className="ss-preview">
           {longform && fields.title && <h2>{fields.title}</h2>}
           {longform && renderMarkdown ? renderMarkdown(draftMarkdown(fields, draft.previews ?? {})) : <p className="ss-plain">{fields.content}</p>}
+          {longform && validVideo && <aside className="ss-video-preview" aria-label="Video companion">
+            <small>Video companion</small>
+            {validVideo.title && <strong>{validVideo.title}</strong>}
+            <a href={validVideo.url} target="_blank" rel="noopener noreferrer">Watch on YouTube</a>
+          </aside>}
           {!longform && fields.images.map(image => <img key={image.id} src={draft.previews?.[image.id]} alt={image.alt} />)}
         </div>}
         <label>Upload image (PNG, JPEG, or WebP, up to 1 MB)
@@ -317,8 +379,17 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
           </div>
         ))}
         {longform && <>
-          <label><span><input type="checkbox" checked={fields.syndicate} onChange={event => change({ syndicate: event.target.checked })} /> Syndicate to Bluesky when published</span></label>
-          {fields.syndicate && <label>Bluesky teaser<input value={fields.teaser} onChange={event => change({ teaser: event.target.value })} /></label>}
+          {!draft.sourceRkey && <label>
+            <span><input type="checkbox" checked={!!fields.managedLaunch}
+              onChange={event => change({ managedLaunch: event.target.checked })} /> Plan the social launch separately</span>
+            <small>Publish the article first, then write and schedule its Bluesky and ActivityPub announcements from Launches.</small>
+          </label>}
+          {fields.managedLaunch
+            ? draft.sourceRkey && <p className="ss-muted">Manage the social announcements for this article in Launches.</p>
+            : <>
+              <label><span><input type="checkbox" checked={fields.syndicate} onChange={event => change({ syndicate: event.target.checked })} /> Syndicate to Bluesky when published</span></label>
+              {fields.syndicate && <label>Bluesky teaser<input value={fields.teaser} onChange={event => change({ teaser: event.target.value })} /></label>}
+            </>}
         </>}
         <h2>Visibility</h2>
         <p className="ss-muted">{draft.sourceRkey ? "Your revision is private until you publish it. The previous version stays public."
@@ -337,8 +408,8 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
           <input type="datetime-local" value={scheduleAt} onChange={event => setScheduleAt(event.target.value)} />
         </label>
         <div className="ss-row">
-          <button type="button" className="ss-primary" onClick={() => mutate(active => client.publish(active.id, active.version))}>Publish now</button>
-          <button type="button" disabled={!scheduleAt} onClick={() => mutate(active =>
+          <button type="button" className="ss-primary" disabled={invalidVideo} onClick={() => mutate(active => client.publish(active.id, active.version))}>Publish now</button>
+          <button type="button" disabled={!scheduleAt || invalidVideo} onClick={() => mutate(active =>
             client.schedule(active.id, active.version, new Date(scheduleAt).toISOString()))}>{draft.scheduledAt ? "Reschedule" : "Schedule"}</button>
           {draft.scheduledAt && <button type="button" onClick={() => mutate(active => client.cancel(active.id, active.version))}>Cancel schedule</button>}
         </div>

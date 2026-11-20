@@ -8,6 +8,9 @@ import {
 } from "./model";
 import { bucket, domain, getDraft, getRecord, PdsError, publicationToken, s3, saveDraft, xrpc } from "./runtime";
 
+import { processLaunch } from "./launch-worker";
+import type { LaunchJob } from "./launch-model";
+
 type BlobRef = { $type: "blob"; ref: { $link: string }; mimeType: string; size: number };
 
 function fingerprint(value: RecordValue) {
@@ -40,7 +43,11 @@ async function assemble(draft: Draft, original: RecordValue | undefined, token: 
         const cid = (media as BlobRef)?.ref?.$link;
         return cid && content.includes(cid) && refs.findIndex(ref => (ref as BlobRef)?.ref?.$link === cid) === index;
       });
-    return { ...common, ...longformFields(draft, content), ...(references.length || original?.media ? { media: references } : {}) };
+    const article: RecordValue = {
+      ...common, ...longformFields(draft, content), ...(references.length || original?.media ? { media: references } : {}),
+    };
+    if (!draft.fields.video) delete article.video;
+    return article;
   }
   const text = draft.fields.content.trim();
   const post: RecordValue = { ...common, text };
@@ -114,9 +121,11 @@ async function processPublication(job: Job, lastTry: boolean) {
 
 export const handler: SQSHandler = async event => {
   for (const delivery of event.Records) {
-    const job = JSON.parse(delivery.body) as Job;
+    const job = JSON.parse(delivery.body) as Job | LaunchJob;
     try {
-      await processPublication(job, Number(delivery.attributes.ApproximateReceiveCount) >= 4);
+      const lastTry = Number(delivery.attributes.ApproximateReceiveCount) >= 4;
+      if ("launchRkey" in job) await processLaunch(job, lastTry);
+      else await processPublication(job, lastTry);
     } catch (error) {
       console.warn("Publication worker will retry", (error as Error).name);
       // Avoid copying private authoring data or function response bodies to logs.

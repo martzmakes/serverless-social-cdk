@@ -113,6 +113,26 @@ The editor supports short posts and longform articles, autosave, image uploads, 
 
 Scheduling uses one-time EventBridge Scheduler jobs and an SQS-triggered publisher. Scheduled times are stored in UTC. Scheduler delivers within the selected minute and publication follows queue processing. Canceled or replaced jobs are ignored when delivered. The draft table and media bucket are retained after stack deletion. Monitor the editor dead-letter queue for exhausted deliveries.
 
+Longform drafts and revisions can include an optional YouTube companion. The published article and its unlisted preview link to YouTube from a card. Reading the article alone loads no YouTube assets.
+
+## Add private messages
+
+Set `directMessages: true` on the backend stack. Mount `DirectMessages` from `@martzmakes/serverless-social/direct-messages-web` inside a signed-in page. Create its client with `createDirectMessagesClient(getStoredAppJwt, window.location.origin)` from `@martzmakes/serverless-social/direct-messages`.
+
+Each message request uses an app session issued for the current site hostname and the signing key for that site's publishing identity. Authors can list conversations, open a thread, start a conversation by Bluesky handle, and send text. Bluesky hosts the conversations. The gateway keeps message bodies out of the PDS, firehose, and analytics and sends responses with caching disabled.
+
+Attached sites use the direct backend hostname so CloudFront can identify their viewer domain. Authors with an older session can sign in again on the site to use Messages.
+
+For Mastodon and other compatible ActivityPub servers, mount `FediverseMessages` from `@martzmakes/serverless-social/fediverse-messages-web` with `createFediverseMessagesClient(getStoredAppJwt, window.location.origin)` from `@martzmakes/serverless-social/fediverse-messages`. Private mentions are signed, addressed to a specific receiving actor, and stored in a dedicated DynamoDB table. The sender's and recipient's servers can read message text.
+
+## Plan an article launch
+
+Enable `editor: true`, then choose **Plan the social launch separately** on a new longform draft. After the article is public, open **Article launches** to write announcements, choose where to send them, and launch or schedule the delivery. The editor can link directly to the article's plan through its optional `onPlanLaunch` callback.
+
+Use the client exported by `@martzmakes/serverless-social/launches` with the signed-in session to mount the `ArticleLaunches` component from `@martzmakes/serverless-social/launches-web`. Pass the existing insights client for article selection and link preview. Both clients follow the site's sharing permissions.
+
+The launch worker checks that the canonical article is public before sending announcements. Bluesky reports when the post is written to the publishing identity's PDS. ActivityPub reports when distribution is queued. The author can retry a failed network separately. Each network's share link includes source tagging for the article's existing insights.
+
 ## Add the publishing calendar
 
 Pass your signed-in layout's origin and token provider to the calendar exported with the editor.

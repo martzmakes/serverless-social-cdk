@@ -6,7 +6,7 @@ import { CreateScheduleCommand, DeleteScheduleCommand, SchedulerClient } from "@
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { verifyJwt } from "../auth/lib/jwt";
 import { canShare, publishingHost, workspaceHost, workspaceSites } from "../auth/site-sharing";
-import { mdToSafeHtml } from "../pds/longform-render";
+import { mdToSafeHtml, renderVideoCompanion, VIDEO_COMPANION_CSS } from "../pds/longform-render";
 import { emptyDraftFields, type EditorDraft, type PostKind } from "../../../editor";
 import {
   collectionFor, extractFields, HttpError, imageMime, keyPattern, markdownWithImages, mediaKey,
@@ -16,6 +16,8 @@ import {
   approvedIdentities, bucket, ddb, domain, env, getDraft, getRecord, getSharedDraft, PdsError,
   previewUrls, s3, saveDraft, sharing, table, xrpc, type PublishedRecord,
 } from "./runtime";
+
+import { handleLaunch } from "./launch-api";
 
 const scheduler = new SchedulerClient({});
 const sqs = new SQSClient({});
@@ -57,7 +59,8 @@ async function share(path: string[]): Promise<APIGatewayProxyStructuredResultV2>
   const urls = Object.fromEntries(draft.fields.images.map(image => [image.id, `${link}/media/${image.id}`]));
   const title = escapeHtml(draft.fields.title || "Post preview");
   const markdown = mdToSafeHtml(markdownWithImages(draft, urls));
-  const content = draft.kind === "longform" ? markdown
+  const video = draft.kind === "longform" ? renderVideoCompanion(draft.fields.video) : "";
+  const content = draft.kind === "longform" ? markdown + video
     : `<p style="white-space:pre-wrap">${escapeHtml(draft.fields.content)}</p>${markdown}`;
   return {
     statusCode: 200,
@@ -66,7 +69,7 @@ async function share(path: string[]): Promise<APIGatewayProxyStructuredResultV2>
       "content-type": "text/html; charset=utf-8",
       "content-security-policy": `default-src 'none'; img-src 'self' https://${domain}/xrpc/com.atproto.sync.getBlob; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
     },
-    body: `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${title}</title><style>body{max-width:70ch;margin:4rem auto;padding:0 1.25rem;font:1.1rem/1.6 system-ui;color-scheme:light dark}img{max-width:100%}pre{overflow:auto}</style><main><p>Unlisted preview</p><h1>${title}</h1>${content}</main></html>`,
+    body: `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${title}</title><style>body{max-width:70ch;margin:4rem auto;padding:0 1.25rem;font:1.1rem/1.6 system-ui;color-scheme:light dark}img{max-width:100%}pre{overflow:auto}${video ? VIDEO_COMPANION_CSS : ""}</style><main><p>Unlisted preview</p><h1>${title}</h1>${content}</main></html>`,
   };
 }
 
@@ -207,6 +210,17 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
     const sourceHost = publishingHost(identity, sharing);
     if (!await canShare(sharing, sourceHost, host)) {
       throw new HttpError(403, "The selected site’s content is unavailable in this workspace.");
+    }
+
+    if (path[0] === "launches" && path.length === 2) {
+      if (!sourceHost) throw new HttpError(403, "This identity has no publishing site.");
+      let rkey: string;
+      try { rkey = decodeURIComponent(path[1]); }
+      catch { throw new HttpError(404, "This article is unavailable."); }
+      return json(200, await handleLaunch({
+        email, host, sourceHost, did, handle: identity.handle, rkey, method,
+        ...(method === "POST" ? { body: readJson(event) } : {}),
+      }));
     }
 
     if (path[0] === "published" && path.length === 1 && method === "GET") {

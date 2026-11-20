@@ -1,0 +1,32 @@
+{
+  "actor": { "did": "did:web:publisher.example", "handle": "publisher.example" },
+  "peer": {
+    "did": "did:plc:abcdefghijklmnopqrstuvwx",
+    "handle": "reader.bsky.social",
+    "displayName": "Fixture Reader",
+    "chatDisabled": false
+  },
+  "message": {
+    "$type": "chat.bsky.convo.defs#messageView",
+    "id": "sample-text",
+    "rev": "rev-002",
+    "text": "Please leave the <draft> in private chat.",
+    "sender": { "did": "did:plc:abcdefghijklmnopqrstuvwx" },
+    "sentAt": "2026-11-19T00:01:00Z",
+    "facets": []
+  },
+  "deleted": {
+    "$type": "chat.bsky.convo.defs#deletedMessageView",
+    "id": "sample-deleted",
+    "rev": "rev-001",
+    "sender": { "did": "did:web:publisher.example" },
+    "sentAt": "2026-11-19T00:00:00Z"
+  },
+  "sent": {
+    "id": "sample-sent",
+    "rev": "rev-003",
+    "text": "Fixture reply",
+    "sender": { "did": "did:web:publisher.example" },
+    "sentAt": "2026-11-19T00:02:00Z"
+  }
+}

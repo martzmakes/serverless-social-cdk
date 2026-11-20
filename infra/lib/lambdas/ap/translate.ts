@@ -12,6 +12,8 @@
  */
 
 import { mdToSafeHtml, stripFrontmatter } from '../pds/longform-render'
+import { launchLink } from '../../../launches'
+import type { ActivityPubLaunch } from '../pds/longform-index'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -41,6 +43,7 @@ export interface AtLongform {
   slug: string
   createdAt: string
   excerpt?: string
+  managedLaunch?: boolean
 }
 
 export interface PostToNoteInput {
@@ -66,6 +69,7 @@ export interface LongformToArticleInput {
   slug: string
   /** ISO time of an edit; set on Update objects so Mastodon applies the edit. */
   updated?: string
+  announcement?: ActivityPubLaunch
 }
 
 /** ActivityPub Note (for short-form posts). No @context — added by wrapping activity. */
@@ -291,6 +295,7 @@ export function longformToArticle({
   pageOrigin,
   slug,
   updated,
+  announcement,
 }: LongformToArticleInput): ApArticle {
   const url = `${pageOrigin}/${slug}`
   const attributedTo = `${origin}/ap/users/${handle}`
@@ -298,11 +303,17 @@ export function longformToArticle({
 
   const body = stripFrontmatter(record.content, record.title)
   const rawExcerpt = record.excerpt !== undefined ? record.excerpt : derivedExcerpt(body)
-  const summary = escapeHtml(rawExcerpt)
+  const summary = escapeHtml(announcement?.text ?? rawExcerpt)
 
-  let content = mdToSafeHtml(body)
-  if (Buffer.byteLength(content, 'utf8') > ARTICLE_HTML_MAX_BYTES) {
-    content = `<p>${summary}</p><p><a href="${escapeHtml(url)}">Read the full post</a></p>`
+  let content: string
+  if (announcement) {
+    const tracked = escapeHtml(launchLink(url, 'fediverse'))
+    content = `${summary ? `<p>${summary.replace(/\n/g, '<br>')}</p>` : ''}<p><a href="${tracked}">Read the full post</a></p>`
+  } else {
+    content = mdToSafeHtml(body)
+    if (Buffer.byteLength(content, 'utf8') > ARTICLE_HTML_MAX_BYTES) {
+      content = `<p>${summary}</p><p><a href="${escapeHtml(url)}">Read the full post</a></p>`
+    }
   }
 
   const article: ApArticle = {
@@ -313,7 +324,7 @@ export function longformToArticle({
     attributedTo,
     summary,
     content,
-    published: record.createdAt,
+    published: announcement?.publishedAt ?? record.createdAt,
     to: [AS_PUBLIC],
     cc: [followers],
   }

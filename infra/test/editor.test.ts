@@ -8,8 +8,12 @@ const fixture = vi.hoisted(() => {
   process.env.SITE_SHARING_TABLE = "sharing";
   process.env.XRPC_ORIGIN = "https://origin.example.com";
   process.env.DRAFT_MEDIA_BUCKET = "draft-media";
+  process.env.LONGFORM_INDEX_TABLE = "articles";
+  process.env.AP_LAUNCH_QUEUE_URL = "ap-launch-queue";
+  process.env.AP_CUSTOM_HOSTS = "writer.example.com,second.example.com";
   return {
     drafts: new Map<string, any>(),
+    index: new Map<string, any>(),
     shares: new Map<string, any>(),
     policies: new Map<string, object>(),
     media: new Map<string, Buffer>(),
@@ -48,13 +52,23 @@ vi.mock("@aws-sdk/lib-dynamodb", async importOriginal => {
             if (command.input.TableName === "sharing") {
               return { Item: fixture.policies.get(`${command.input.Key?.pk}/${command.input.Key?.sk}`) };
             }
+            if (command.input.TableName === "articles") {
+              return { Item: structuredClone(fixture.index.get(`${command.input.Key?.pk}/${command.input.Key?.sk}`)) };
+            }
             return { Item: structuredClone(fixture.drafts.get(key(command.input.Key as any))) };
+          }
+          if (command instanceof sdk.UpdateCommand && command.input.TableName === "articles") {
+            const item = fixture.index.get(`${command.input.Key?.pk}/${command.input.Key?.sk}`);
+            if (item?.item?.status !== "published" || !item.item.managedLaunch) throw conflict();
+            const field = command.input.ExpressionAttributeNames?.["#field"]!;
+            item[field] ??= structuredClone(command.input.ExpressionAttributeValues?.[":value"]);
+            return {};
           }
           if (command instanceof sdk.PutCommand) {
             const item = structuredClone(command.input.Item as any);
             const id = key(item);
             const current = fixture.drafts.get(id);
-            const expected = command.input.ExpressionAttributeValues?.[":old"];
+            const expected = command.input.ExpressionAttributeValues?.[":old"] ?? command.input.ExpressionAttributeValues?.[":prior"];
             if (current?.version !== expected) throw conflict();
             fixture.drafts.set(id, item);
             // Preserve stale GSI snapshots to exercise the consistent read on link revocation.
@@ -261,6 +275,59 @@ describe("editor authorization and publication", () => {
     expect(updated.record).toEqual({ ...original, text: "Edited text" });
   });
 
+  it("saves, previews, publishes, and removes an optional video companion on an article revision", async () => {
+    let record: { value: Record<string, unknown>; cid: string; uri: string } | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (url: URL, init: RequestInit) => {
+      if (url.pathname.endsWith(".getRecord")) return record
+        ? Response.json(record)
+        : Response.json({ error: "RecordNotFound" }, { status: 400 });
+      if (!url.pathname.endsWith(".putRecord")) throw Error("Unexpected XRPC");
+      const saved = JSON.parse(init.body as string);
+      record = { value: saved.record, cid: `cid-${record ? "edit" : "original"}`, uri: `at://${did}/${saved.collection}/${saved.rkey}` };
+      return Response.json(record);
+    }));
+    const draft = await create("longform");
+    const fields = { ...draft.fields, content: "The article", title: "Article and video" };
+    const video = { url: "https://www.youtube.com/watch?v=M7lc1UVf-VE", title: 'Demo <script> "overview"' };
+    expect((await request("PUT", `/${draft.id}`, {
+      version: 1, fields: { ...fields, video: { url: "https://www.youtube.com.evil.example/watch?v=M7lc1UVf-VE" } },
+    })).status).toBe(400);
+    const post = await create("post");
+    expect((await request("PUT", `/${post.id}`, { version: 1, fields: { ...post.fields, video } })).status).toBe(400);
+
+    const save = await request("PUT", `/${draft.id}`, {
+      version: 1, fields: { ...fields, video: { ...video, url: "https://youtu.be/M7lc1UVf-VE?si=tracking" }, managedLaunch: true },
+    });
+    expect(save.status).toBe(200);
+    const saved: EditorDraft = JSON.parse(save.body);
+    expect(JSON.parse((await request("GET", `/${draft.id}`)).body).fields).toMatchObject({ video, managedLaunch: true });
+    const shared: EditorDraft = JSON.parse((await request("POST", `/${draft.id}/share`, { enabled: true, version: saved.version })).body);
+    const share = await request("GET", new URL(shared.shareUrl!).pathname.replace("/auth/editor", ""), undefined, null);
+    expect(share.status).toBe(200);
+    expect(share.body).toContain(`href="${video.url}"`);
+    expect(share.body).toContain("Demo &lt;script&gt; &quot;overview&quot;");
+    expect(share.body).not.toContain("<iframe");
+    expect(fetch).not.toHaveBeenCalled();
+
+    expect((await request("POST", `/${draft.id}/publish`, { version: shared.version })).status).toBe(202);
+    await deliver(fixture.messages[0]);
+    expect(record?.value).toMatchObject({ video, managedLaunch: true, content: fields.content });
+    const published: EditorDraft = JSON.parse((await request("GET", `/${draft.id}`)).body);
+    const revision = await create("longform", published.result!.rkey);
+    expect(revision.fields).toMatchObject({ video, managedLaunch: true });
+    const revise = await request("PUT", `/${revision.id}`, {
+      version: revision.version, fields: { ...revision.fields, video: undefined, managedLaunch: false },
+    });
+    expect(revise.status).toBe(200);
+    const revised: EditorDraft = JSON.parse(revise.body);
+    expect(revised.fields).not.toHaveProperty("video");
+    expect(revised.fields.managedLaunch).toBe(true);
+    expect((await request("POST", `/${revision.id}/publish`, { version: revised.version })).status).toBe(202);
+    await deliver(fixture.messages[1]);
+    expect(record?.value).not.toHaveProperty("video");
+    expect(record?.value.managedLaunch).toBe(true);
+  });
+
   it("reconciles a commit with a lost response without publishing a duplicate", async () => {
     let publicRecord: any;
     let writes = 0;
@@ -319,4 +386,122 @@ it("copies photos to an approved identity as an independent, idempotent private 
   expect(fixture.media.get(`${copy.id}/${copy.fields.images[0].id}`)).toEqual(png);
   expect(JSON.parse((await request("POST", action, input)).body).id).toBe(copy.id);
   expect((await request("GET", `/${copy.id}`)).status).toBe(404);
+});
+
+describe("managed article launches", () => {
+  const key = "3mlaunchtest2";
+  const canonical = "https://writer.example.com/article";
+  const indexKey = `IDX#${did}/${key}`;
+  const inputs = {
+    bluesky: { enabled: true, text: "New writing ✨" },
+    fediverse: { enabled: true, text: "For ActivityPub readers." },
+  };
+
+  beforeEach(() => {
+    fixture.drafts.clear();
+    fixture.index.clear();
+    fixture.policies.clear();
+    fixture.scheduled.length = 0;
+    fixture.messages.length = 0;
+    fixture.index.set(indexKey, { item: {
+      rkey: key, currentSlug: "article", title: "Article", excerpt: "A short article",
+      status: "published", managedLaunch: true, syndication: {}, publishedAt: "2026-11-19T19:00:00.000Z",
+    } });
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  it("requires site permissions and allows canceling a scheduled launch before its job runs", async () => {
+    const path = `/launches/${key}`;
+    const time = new Date(Date.now() + 3600_000).toISOString();
+    const version = JSON.parse((await request("GET", path)).body).version;
+    const result = await request("POST", path, { action: "launch", version, channels: inputs, at: time });
+    expect(result.status).toBe(200);
+    const scheduled = JSON.parse(result.body);
+    expect(scheduled.run).toEqual({
+      at: new Date(Math.ceil(Date.parse(time) / 1000) * 1000).toISOString(), platforms: ["bluesky", "fediverse"],
+    });
+    expect(fixture.messages).toHaveLength(0);
+    expect((await request("GET", path, undefined, "second.example.com", did, "second.example.com")).status).toBe(403);
+    fixture.policies.set("SITE_SHARING#writer.example.com/second.example.com", { outgoing: false });
+    expect((await request("GET", path, undefined, "writer.example.com", did, "second.example.com")).status).toBe(403);
+    expect((await request("POST", path, { action: "launch", version, channels: inputs })).status).toBe(409);
+    expect((await request("POST", path, { action: "cancel", version: scheduled.version })).status).toBe(200);
+    await deliver(fixture.scheduled[0].Target.Input);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(fixture.messages).toHaveLength(0);
+  });
+
+  it("checks canonical HTML, preserves partial success, and reconciles a Bluesky write that lost its response", async () => {
+    let write: any;
+    const calls = vi.mocked(fetch).mockImplementation(async (input, options) => {
+      const url = new URL(String(input));
+      if (input === canonical) {
+        return new Response(`<html><head><link rel="canonical" href="${canonical}"></head></html>`, {
+          headers: { "content-type": "text/html" },
+        });
+      }
+      if (url.pathname.endsWith(".getRecord")) {
+        if (!write) return Response.json({ error: "RecordNotFound" }, { status: 404 });
+        expect(url.searchParams.get("rkey")).toBe(write.rkey);
+        return Response.json({ uri: `at://${did}/app.bsky.feed.post/${write.rkey}`, cid: "posted-cid", value: write.record });
+      }
+      if (url.pathname.endsWith(".putRecord")) {
+        expect(write).toBeUndefined();
+        write = JSON.parse(options!.body as string);
+        expect(write.swapRecord).toBeNull();
+        expect(write.record.text).toBe("New writing ✨\n\n" + canonical + "?utm_source=bluesky");
+        expect(write.record.facets[0].index.byteStart).toBe(Buffer.byteLength("New writing ✨\n\n"));
+        throw new Error("PDS response lost after commit");
+      }
+      throw Error("Unexpected request");
+    });
+
+    const path = `/launches/${key}`;
+    const first = JSON.parse((await request("POST", path, { action: "launch", version: 0, channels: inputs })).body);
+    expect(first.run.platforms).toEqual(["bluesky", "fediverse"]);
+    await deliver(fixture.messages[0]);
+    const partial = JSON.parse((await request("GET", path)).body);
+    expect(partial.channels.bluesky.state).toBe("failed");
+    expect(partial.channels.fediverse).toMatchObject({
+      state: "queued", url: `https://writer.example.com/ap/users/writer.example.com/articles/${key}`,
+    });
+    expect(JSON.parse(fixture.messages[1])).toEqual({
+      kind: "event", event: { collection: "social.serverless.longform", did, launch: true, op: "create", rkey: key },
+    });
+    expect(fixture.index.get(indexKey).launchActivityPub.text).toBe(inputs.fediverse.text);
+
+    const retry = JSON.parse((await request("POST", path, { action: "retry", version: partial.version })).body);
+    expect(retry.run.platforms).toEqual(["bluesky"]);
+    await deliver(fixture.messages[2]);
+    await deliver(fixture.messages[0]);
+    await deliver(fixture.messages[2]);
+    const final = JSON.parse((await request("GET", path)).body);
+    expect(final.channels.bluesky).toMatchObject({
+      state: "posted", url: `https://bsky.app/profile/${encodeURIComponent(did)}/post/${write.rkey}`,
+    });
+    expect(fixture.index.get(indexKey).launchBluesky.cid).toBe("posted-cid");
+    expect(final.channels.fediverse.state).toBe("queued");
+    expect(final.run).toBeUndefined();
+    expect(fixture.messages).toHaveLength(3);
+    expect(calls.mock.calls.filter(([url]) => new URL(String(url)).pathname.endsWith(".putRecord"))).toHaveLength(1);
+  });
+
+  it("blocks announcements when a 200 response is the app shell, and keeps automatic articles read-only", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response("<html><head><title>App shell</title></head></html>", {
+      headers: { "content-type": "text/html" },
+    }));
+    const path = `/launches/${key}`;
+    expect((await request("POST", path, { action: "launch", version: 0, channels: inputs })).status).toBe(200);
+    await deliver(fixture.messages[0], 4);
+    const plan = JSON.parse((await request("GET", path)).body);
+    expect(plan.channels.bluesky).toMatchObject({ state: "failed", error: expect.stringContaining("public article") });
+    expect(plan.channels.fediverse.state).toBe("failed");
+    expect(fixture.messages).toHaveLength(1);
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(canonical, expect.objectContaining({ redirect: "error" }));
+
+    fixture.index.get(indexKey).item.managedLaunch = undefined;
+    const automatic = JSON.parse((await request("GET", path)).body);
+    expect(automatic.mode).toBe("automatic");
+    expect((await request("POST", path, { action: "launch", version: 0, channels: inputs })).status).toBe(409);
+  });
 });

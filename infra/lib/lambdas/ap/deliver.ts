@@ -57,6 +57,8 @@ import { canonicalApOrigin, pageOriginFor } from './host'
 // Constants
 // ---------------------------------------------------------------------------
 
+import type { ActivityPubLaunch } from '../pds/longform-index'
+
 export const COLL_POST = 'app.bsky.feed.post'
 export const COLL_LONGFORM = 'social.serverless.longform'
 const AS_CONTEXT = 'https://www.w3.org/ns/activitystreams'
@@ -91,6 +93,8 @@ export interface DeliverEvent {
   cid?: string
   /** ISO approximate stream-record time (deterministic Update `updated`). */
   at?: string
+  /** Explicit handoff from the authoring launch scheduler. */
+  launch?: true
 }
 
 /** Follower entry with actorId and inbox URL (needed for delivery). */
@@ -143,6 +147,8 @@ export interface LongformIndexEntry {
   /** Record cid the renderer rendered. */
   cid: string
   status: 'published' | 'deleted'
+  managedLaunch?: boolean
+  announcement?: ActivityPubLaunch
 }
 
 /**
@@ -378,6 +384,10 @@ async function buildActivity(
 
   if (ev.op === 'delete') {
     if (collection === COLL_POST && await deps.isBlueskyOnly?.(did, rkey)) return null
+    if (collection === COLL_LONGFORM) {
+      const index = await deps.getLongformIndex(did, rkey)
+      if (index?.managedLaunch && !index.announcement) return null
+    }
     const del = wrapDelete(actorId, objectId, [AS_PUBLIC], [followers], `${objectId}#delete`)
     return { id: del.id, doc: { '@context': AS_CONTEXT, ...del } }
   }
@@ -392,13 +402,15 @@ async function buildActivity(
       logSkip('record_not_found', ev, handle)
       return null
     }
+    if (rec.managedLaunch && !ev.launch) return null
+    if (ev.launch && !rec.managedLaunch) return null
     // ORDERING: the longform INSERT reaches this consumer and the renderer in
     // parallel. The page URL is only real once the renderer has written the
     // page and its index entry (slug can be normalized or collision-suffixed).
     // Never guess: delivering a URL that 404s is a bug.
     const idx = await deps.getLongformIndex(did, rkey)
     const ready =
-      !!idx && idx.status === 'published' && (!ev.cid || idx.cid === ev.cid)
+      !!idx && idx.status === 'published' && (!ev.cid || idx.cid === ev.cid) && (!ev.launch || !!idx.announcement)
     if (!ready) {
       if (mode === 'retry') throw new NotReadyError('longform page not published yet')
       console.warn(
@@ -421,6 +433,7 @@ async function buildActivity(
       pageOrigin: pageOriginFor(handle),
       slug: idx!.slug,
       updated,
+      announcement: idx!.announcement,
     })
   } else {
     const record = await deps.loadPostRecord(did, rkey)

@@ -11,6 +11,12 @@
     "editor.ts",
     "editor-web.tsx",
     "insights.ts",
-    "insights-web.tsx"
+    "insights-web.tsx",
+    "direct-messages.ts",
+    "direct-messages-web.tsx",
+    "fediverse-messages.ts",
+    "fediverse-messages-web.tsx",
+    "launches.ts",
+    "launches-web.tsx"
   ]
 }

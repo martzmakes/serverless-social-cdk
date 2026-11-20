@@ -94,6 +94,11 @@ import {
   type ArticleReplyStore, type OutgoingArticleReply,
 } from './article-replies'
 import { safeHttpsUrl } from './sanitize'
+import { FEDIVERSE_MESSAGES_PATH } from '../../../fediverse-messages'
+import {
+  ingestPrivateMention, parsePrivateMention, privateMessageView, sendPrivateMention,
+  validPrivateMessageCursor, PrivateMentionError, type PrivateMentionPorts,
+} from './private-mentions'
 
 // ---------------------------------------------------------------------------
 // AP-owned env keys (Task 9 wires the tables; ap-deps.ts reads them).
@@ -110,6 +115,7 @@ export const AP_ENV = {
   AP_FOLLOWING_TABLE: 'AP_FOLLOWING_TABLE',
   /** Ingested posts from followees (pk=handle, sk=key, GSI byPublished, 90 d TTL). */
   AP_INBOUND_TABLE: 'AP_INBOUND_TABLE',
+  AP_PRIVATE_MESSAGES_TABLE: 'AP_PRIVATE_MESSAGES_TABLE',
 } as const
 
 const ORIGIN = PDS_ENDPOINT // https://serverless.social
@@ -157,6 +163,8 @@ export interface RemoteActor {
   publicKeyPem: string
 }
 
+import type { ActivityPubLaunch } from '../pds/longform-index'
+
 /** Injected dependency bundle — every external effect dispatch needs. */
 export interface ApDeps {
   tenantStore: TenantStore
@@ -182,7 +190,7 @@ export interface ApDeps {
     cursor?: string,
   ): Promise<{
     /** `slug` is set on longform records: the slug the renderer published. */
-    records: { uri: string; cid: string; value: unknown; slug?: string }[]
+    records: { uri: string; cid: string; value: unknown; slug?: string; announcement?: ActivityPubLaunch }[]
     cursor?: string
   }>
   /**
@@ -202,7 +210,7 @@ export interface ApDeps {
   getArticle?(
     did: string,
     rkey: string,
-  ): Promise<{ record: AtLongform; slug: string } | null>
+  ): Promise<{ record: AtLongform; slug: string; announcement?: ActivityPubLaunch } | null>
   /**
    * Retry queue for failed outbound deliveries (the Accept). Optional only so
    * tests can omit it; without it a failed Accept surfaces as a 500 and the
@@ -225,6 +233,7 @@ export interface ApDeps {
   /** Ingested posts from accepted followees. */
   inbound?: ApInboundStore
   articleReplies?: ArticleReplyStore
+  privateMentions?: PrivateMentionPorts
   deliverArticleReply?(handle: string, actor: string, reply: OutgoingArticleReply): Promise<DeliveryOutcome>
   /**
    * GET returning parsed JSON behind assertSafeRemoteUrl (https only, every
@@ -579,6 +588,16 @@ async function handleInbox(
     return err(401, 'Unauthorized', 'Activity actor does not match signer')
   }
 
+  if (deps.privateMentions && (type === 'Create' || type === 'Update' || type === 'Delete') && activityActor === actorId) {
+    try {
+      if (await ingestPrivateMention(activity, { did, handle, origin }, actorId, deps.privateMentions.store)) {
+        return json(202, { status: 'accepted' })
+      }
+    } catch {
+      return err(503, 'Unavailable', 'Could not process the activity')
+    }
+  }
+
   // One structured line per accepted (verified) activity: type + actor host
   // only - never the content. `type` is attacker-chosen text: clamp it.
   console.log(
@@ -859,6 +878,46 @@ async function isOwner(req: ApRequest, tenant: Tenant | null, deps: ApDeps): Pro
   }
 }
 
+const privateMessageHeaders = {
+  'cache-control': 'private, no-store',
+  'referrer-policy': 'no-referrer',
+  'x-content-type-options': 'nosniff',
+}
+
+async function handlePrivateMessages(req: ApRequest, deps: ApDeps): Promise<ApResult> {
+  const respond = (result: ApResult) => ({ ...result, headers: { ...result.headers, ...privateMessageHeaders } })
+  if (req.method === 'OPTIONS') return respond({ status: 204, body: '', contentType: 'text/plain' })
+  const ports = deps.privateMentions
+  if (!ports) return respond(err(503, 'Unavailable', 'Fediverse messages are unavailable.'))
+  try {
+    const actor = await ports.authenticate(req.headers.authorization, req.headers['x-pds-viewer-host'], req.headers.origin)
+    if (!actor) return respond(err(403, 'Forbidden', 'Sign in on this site as its owner to open Fediverse messages.'))
+    const cursor = req.query.cursor
+    if (Object.keys(req.query).some(key => key !== 'cursor') ||
+      (cursor !== undefined && (req.method !== 'GET' || !validPrivateMessageCursor(cursor)))) {
+      return respond(err(400, 'BadRequest', 'Invalid messages page.'))
+    }
+    if (req.method === 'GET') {
+      const page = await ports.store.list(actor.did, cursor)
+      return respond(json(200, {
+        actor: { handle: actor.handle, acct: `@${actor.handle.split('.')[0]}@${new URL(actor.origin).hostname}` },
+        messages: page.messages.flatMap(row => privateMessageView(row) ?? []), cursor: page.cursor,
+      }, 'application/json'))
+    }
+    if (req.method !== 'POST') return respond(err(405, 'MethodNotAllowed', 'Method not allowed'))
+    const body = parseOwnerBody(req, 16_000)
+    if ('error' in body) return respond(body.error)
+    const message = await sendPrivateMention(actor, parsePrivateMention(body.value), ports)
+    return respond(json(200, { message }, 'application/json'))
+  } catch (error) {
+    if (error instanceof PrivateMentionError) return respond(err(error.status, 'MessageError', error.message))
+    // Storage and transport exceptions can include private request data.
+    return respond(err(503, 'Unavailable', req.method === 'POST'
+      ? 'Send status could not be confirmed. Retry the same message.'
+      : 'Could not open your Fediverse messages.'))
+  }
+}
+
 function parseOwnerBody(req: ApRequest, maxBytes = OWNER_MAX_BODY_BYTES): { value: any } | { error: ApResult } {
   if (req.rawBody.length > maxBytes) {
     return { error: err(413, 'PayloadTooLarge', 'Request body too large') }
@@ -1052,6 +1111,8 @@ export async function dispatch(
   try {
     const { method, path } = req
 
+    if (path === FEDIVERSE_MESSAGES_PATH) return await handlePrivateMessages(req, deps)
+
     // ── GET /.well-known/webfinger ────────────────────────────────────────
     if (method === 'GET' && path === '/.well-known/webfinger') {
       const resource = req.query.resource
@@ -1218,6 +1279,7 @@ export async function dispatch(
                 origin,
                 pageOrigin: pageOriginFor(tenant.handle),
                 slug: r.slug,
+                announcement: r.announcement,
               }),
             )
           } else {
@@ -1298,6 +1360,7 @@ export async function dispatch(
               origin,
               pageOrigin: pageOriginFor(tenant.handle),
               slug: art.slug,
+              announcement: art.announcement,
             }),
           },
           AS,

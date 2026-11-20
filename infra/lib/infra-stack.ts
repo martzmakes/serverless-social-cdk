@@ -73,6 +73,8 @@ export interface ServerlessSocialStackProps extends cdk.StackProps {
   readonly pdsHandle?: string;
   /** Add a private draft editor and scheduled publishing to the shared PDS. */
   readonly editor?: boolean;
+  /** Expose site-owner Bluesky conversations through the private author API. */
+  readonly directMessages?: boolean;
 }
 
 export class InfraStack extends cdk.Stack {
@@ -331,8 +333,53 @@ export class InfraStack extends cdk.Stack {
     };
     const postAnalytics = new PostAnalyticsTable(this, "PostAnalyticsTable");
 
-    if (props.editor) {
-      new PostEditor(this, "PostEditor", {
+    if (props.directMessages) {
+      const directMessages = new lambda.NodejsFunction(this, "DirectMessages", {
+        ...lambdaDefaults,
+        timeout: cdk.Duration.seconds(24),
+        environment: {
+          DOMAIN,
+          PROJECT_SLUG,
+          JWT_SECRET_NAME,
+          PDS_HANDLE: pdsHandle,
+          TENANTS_TABLE: tenantsTable.table.tableName,
+          KNOWN_TENANT_HOSTS,
+          ALLOWED_EMAILS: allowedEmails,
+          SIGNING_KEY_PARAM: ATPROTO_SIGNING_KEY_NAME,
+        },
+        ...lambdaSource("chat/handler"),
+      });
+      jwtSecretParam.grantRead(directMessages);
+      atprotoSigningKeyParam.grantRead(directMessages);
+      tenantsTable.table.grantReadData(directMessages);
+      directMessages.addToRolePolicy(new iam.PolicyStatement({
+        actions: ["ssm:GetParameter"],
+        resources: [this.formatArn({
+          service: "ssm",
+          resource: "parameter",
+          resourceName: `${PROJECT_SLUG}/tenants/*/signing`,
+        })],
+      }));
+      const chatIntegration = new apigwv2Integrations.HttpLambdaIntegration("DirectMessagesIntegration", directMessages);
+      authHttpApi.addRoutes({
+        path: "/auth/messages",
+        methods: [apigwv2.HttpMethod.GET],
+        integration: chatIntegration,
+      });
+      authHttpApi.addRoutes({
+        path: "/auth/messages/conversations",
+        methods: [apigwv2.HttpMethod.POST],
+        integration: chatIntegration,
+      });
+      authHttpApi.addRoutes({
+        path: "/auth/messages/conversations/{conversationId}",
+        methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+        integration: chatIntegration,
+      });
+    }
+
+    const postEditor = props.editor
+      ? new PostEditor(this, "PostEditor", {
         api: authHttpApi,
         tenants: tenantsTable.table,
         sharingTable: postAnalytics.table,
@@ -345,8 +392,8 @@ export class InfraStack extends cdk.Stack {
           ALLOWED_EMAILS: allowedEmails,
           KNOWN_TENANT_HOSTS,
         },
-      });
-    }
+      })
+      : undefined;
 
     const requestMagicLinkHandler = new lambda.NodejsFunction(
       this,
@@ -791,7 +838,12 @@ export class InfraStack extends cdk.Stack {
 
     // The renderer's published-longform index (declared here, ahead of its
     // renderer, because AP needs it to build Article urls).
-    const longformIndex = new LongformIndexTable(this, "LongformIndexTable");
+    const longformIndex = new LongformIndexTable(this, "LongformIndexTable", { launchStream: !!postEditor });
+    postEditor?.configureLaunches({
+      index: longformIndex.table,
+      apRetryQueue: apDeliveryRetryQueue,
+      apCustomHosts: KNOWN_TENANT_HOSTS,
+    });
 
     const apLambdaEnv = {
       ...lambdaDefaults.environment,
@@ -826,6 +878,14 @@ export class InfraStack extends cdk.Stack {
       ],
     });
 
+    const privateMentions = props.directMessages ? new dynamodb.Table(this, "ApPrivateMessages", {
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "sk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    }) : undefined;
+
     const apHandler = new lambda.NodejsFunction(this, "ApHandler", {
       ...lambdaDefaults,
       timeout: cdk.Duration.seconds(29),
@@ -840,6 +900,11 @@ export class InfraStack extends cdk.Stack {
         // verifies the first-party session JWT (same secret as /xrpc).
         AP_FOLLOWING_TABLE: apFollowingTable.tableName,
         JWT_SECRET_PARAM: JWT_SECRET_NAME,
+        ...(privateMentions ? {
+          AP_PRIVATE_MESSAGES_TABLE: privateMentions.tableName,
+          ALLOWED_EMAILS: allowedEmails,
+          KNOWN_TENANT_HOSTS,
+        } : {}),
       },
       ...lambdaSource("ap/handler"),
     });
@@ -911,6 +976,15 @@ export class InfraStack extends cdk.Stack {
       ],
       integration: apIntegration,
     });
+
+    if (privateMentions) {
+      privateMentions.grantReadWriteData(apHandler);
+      authHttpApi.addRoutes({
+        path: "/auth/fediverse-messages",
+        methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+        integration: apIntegration,
+      });
+    }
 
     // ── AP delivery consumer (RepoTable DDB-stream → remote follower inboxes)
     //
@@ -1265,6 +1339,19 @@ export class InfraStack extends cdk.Stack {
         }),
       ],
     }));
+
+    if (postEditor) {
+      longformRenderer.addEventSource(new DynamoEventSource(longformIndex.table, {
+        startingPosition: StartingPosition.TRIM_HORIZON,
+        batchSize: 10,
+        retryAttempts: 5,
+        bisectBatchOnError: true,
+        onFailure: new SqsDlq(longformDlq),
+        filters: [lambdaRuntime.FilterCriteria.filter({
+          dynamodb: { NewImage: { launchBluesky: { M: { uri: { S: [{ prefix: "at://" }] } } } } },
+        })],
+      }));
+    }
 
     // Observability-only (no SNS action by design at single-author scale;
     // failures already durably captured in LongformRendererDlq).

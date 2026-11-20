@@ -1,4 +1,5 @@
 import { draftMarkdown, emptyDraftFields, type DraftFields, type EditorDraft, type PostKind } from "../../../editor";
+import { normalizeVideoCompanion } from "../../../youtube";
 import { safeSlug } from "../pds/longform-routing";
 
 export const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -46,6 +47,14 @@ export function validateFields(input: unknown, draft: Draft): DraftFields {
   if (new Set(images.map(image => image.id)).size !== images.length) {
     throw new HttpError(400, "Each image can be attached once.");
   }
+  const video = normalizeVideoCompanion(f.video);
+  if (f.video !== undefined && (draft.kind !== "longform" || !video)) {
+    throw new HttpError(400, "Add a valid HTTPS YouTube video link and an optional title.");
+  }
+  if (f.managedLaunch !== undefined && (draft.kind !== "longform" || typeof f.managedLaunch !== "boolean")) {
+    throw new HttpError(400, "Launch planning applies to articles.");
+  }
+  const managedLaunch = draft.source ? draft.fields.managedLaunch : f.managedLaunch;
   return {
     content: textField(f.content, maxContentBytes),
     title: textField(f.title, 1200),
@@ -55,6 +64,8 @@ export function validateFields(input: unknown, draft: Draft): DraftFields {
     tags: f.tags.map(tag => textField(tag, 200).trim()).filter(Boolean),
     syndicate: f.syndicate,
     images,
+    ...(video && { video }),
+    ...(managedLaunch && { managedLaunch: true }),
   };
 }
 
@@ -68,6 +79,7 @@ export function imageMime(bytes: Buffer): string {
 
 export function extractFields(kind: PostKind, value: RecordValue): DraftFields {
   const string = (v: unknown) => typeof v === "string" ? v : "";
+  const video = kind === "longform" ? normalizeVideoCompanion(value.video) : undefined;
   return {
     ...emptyDraftFields(),
     content: string(kind === "post" ? value.text : value.content),
@@ -77,6 +89,8 @@ export function extractFields(kind: PostKind, value: RecordValue): DraftFields {
     tags: Array.isArray(value.tags) ? value.tags.filter((v): v is string => typeof v === "string") : [],
     teaser: string(value.syndicationTeaser),
     syndicate: value.syndicate !== false,
+    ...(video && { video }),
+    ...(kind === "longform" && value.managedLaunch === true && { managedLaunch: true }),
   };
 }
 
@@ -116,6 +130,11 @@ export function markdownWithImages(draft: Draft, urls: Record<string, string>) {
 }
 
 export function longformFields(draft: Draft, content: string) {
-  const { title, slug, excerpt, tags, teaser, syndicate } = draft.fields;
-  return { title: title.trim(), slug: safeSlug(slug || title), content, excerpt: excerpt.trim(), tags, syndicationTeaser: teaser.trim(), syndicate };
+  const { title, slug, excerpt, tags, teaser, syndicate, video, managedLaunch } = draft.fields;
+  return {
+    title: title.trim(), slug: safeSlug(slug || title), content, excerpt: excerpt.trim(), tags,
+    syndicationTeaser: teaser.trim(), syndicate,
+    ...(video && { video }),
+    ...(managedLaunch && { managedLaunch: true }),
+  };
 }

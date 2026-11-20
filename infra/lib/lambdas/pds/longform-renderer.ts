@@ -1,4 +1,4 @@
-import { renderArticleHtml, pickRelated, type AuthorProfile, type LongformContent, type RenderCtx } from './longform-render'
+import { patchManagedBluesky, renderArticleHtml, pickRelated, type AuthorProfile, type LongformContent, type RenderCtx } from './longform-render'
 import { renderSitemap, renderRss, renderAtom } from './longform-feeds'
 import { applyUpsert, applyDelete, toFeedItems, type IndexItem } from './longform-index'
 import { renderIndexPage } from './longform-index-page'
@@ -38,6 +38,32 @@ export interface Ports {
   deleteSyndication(uri: string, scope?: TenantScope): Promise<void>
 }
 export interface RenderEvent { rkey: string; op: 'upsert' | 'delete'; cid?: string; did?: string }
+
+export interface ManagedBlueskyEvent {
+  rkey: string
+  did: string
+  syndication: NonNullable<IndexItem['syndication']['bsky']>
+}
+
+export interface DiscussionPorts {
+  getIndex: Ports['getIndex']
+  readArticle(path: string): Promise<{ html: string; etag: string }>
+  updateArticle(path: string, html: string, etag: string): Promise<void>
+}
+
+/** Index replay updates at most one unchanged, currently published HTML object. */
+export async function refreshManagedDiscussion(
+  event: ManagedBlueskyEvent, ports: DiscussionPorts, ctx: RenderCtx, scope: TenantScope,
+) {
+  const current = await ports.getIndex(event.rkey, scope)
+  if (current?.status !== 'published' || !current.managedLaunch || !/^[a-z0-9-]+$/.test(current.currentSlug)) return
+  const bsky = current.syndication.bsky
+  if (!bsky || bsky.uri !== event.syndication.uri || bsky.cid !== event.syndication.cid) return
+  const path = `${scope.s3Prefix}${current.currentSlug}/index.html`
+  const { html, etag } = await ports.readArticle(path)
+  const updated = patchManagedBluesky(html, bsky, ctx)
+  if (updated !== html) await ports.updateArticle(path, updated, etag)
+}
 
 const XML = 'application/xml; charset=utf-8'
 
@@ -93,7 +119,7 @@ export async function processEvent(ev: RenderEvent, p: Ports, ctx: RenderCtx, s3
   const owner = await p.ownerOf(cleanSlug, sc)
   const next = applyUpsert(prev, {
     rkey: ev.rkey, slug: cleanSlug, cid: ev.cid ?? 'unknown',
-    title: rec.title, excerpt: rec.excerpt ?? '', tags: rec.tags ?? [], createdAt: rec.createdAt,
+    title: rec.title, excerpt: rec.excerpt ?? '', tags: rec.tags ?? [], createdAt: rec.createdAt, managedLaunch: rec.managedLaunch,
   }, (s) => (s === cleanSlug ? owner : undefined))
 
   // Task 15: the author card and related posts need the index and the profile.
@@ -131,7 +157,7 @@ export async function processEvent(ev: RenderEvent, p: Ports, ctx: RenderCtx, s3
   }
   await p.kvsDel(next.currentSlug, sc)
 
-  if (!next.syndication.bsky && rec.syndicate !== false) {
+  if (!next.syndication.bsky && !next.managedLaunch && rec.syndicate !== false) {
     try {
       const res = await p.syndicate(buildBlueskySyndication({ ...rec, slug: next.currentSlug }, ctx), sc)
       next.syndication = { bsky: res }
@@ -176,7 +202,7 @@ export async function processEvent(ev: RenderEvent, p: Ports, ctx: RenderCtx, s3
 }
 
 export async function handler(event: { Records: any[] }): Promise<void> {
-  const { makeAwsPorts, eventsFromStream, makeRendererTenantStore, targetForRepo } =
+  const { makeAwsPorts, eventsFromStream, managedBlueskyEventsFromStream, makeRendererTenantStore, targetForRepo } =
     await import('./longform-renderer-aws.js')
   const ports = makeAwsPorts()
   const store = makeRendererTenantStore()
@@ -198,5 +224,13 @@ export async function handler(event: { Records: any[] }): Promise<void> {
       ? DEFAULT_APEX_SCOPE
       : { did: ev.did!, isApex: false, s3Prefix: tgt.s3Prefix }
     await processEvent(ev, ports, ctx, tgt.s3Prefix, scope)
+  }
+  for (const ev of managedBlueskyEventsFromStream(event)) {
+    const target = await targetForRepo(ev.did, store)
+    if (!target.s3Prefix && ev.did !== APEX_DID) continue
+    const scope = target.s3Prefix
+      ? { did: ev.did, isApex: false, s3Prefix: target.s3Prefix }
+      : DEFAULT_APEX_SCOPE
+    await refreshManagedDiscussion(ev, ports, { origin: target.origin, siteName: target.siteName, author: target.author }, scope)
   }
 }

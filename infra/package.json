@@ -1,6 +1,6 @@
 {
   "name": "@martzmakes/serverless-social",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "AWS CDK constructs for an AT Protocol PDS, shared firehose, and static sites",
   "repository": {
     "type": "git",
@@ -88,6 +88,30 @@
     "./insights-web": {
       "types": "./dist/insights-web.d.ts",
       "default": "./dist/insights-web.js"
+    },
+    "./direct-messages": {
+      "types": "./dist/direct-messages.d.ts",
+      "default": "./dist/direct-messages.js"
+    },
+    "./direct-messages-web": {
+      "types": "./dist/direct-messages-web.d.ts",
+      "default": "./dist/direct-messages-web.js"
+    },
+    "./launches": {
+      "types": "./dist/launches.d.ts",
+      "default": "./dist/launches.js"
+    },
+    "./launches-web": {
+      "types": "./dist/launches-web.d.ts",
+      "default": "./dist/launches-web.js"
+    },
+    "./fediverse-messages": {
+      "types": "./dist/fediverse-messages.d.ts",
+      "default": "./dist/fediverse-messages.js"
+    },
+    "./fediverse-messages-web": {
+      "types": "./dist/fediverse-messages-web.d.ts",
+      "default": "./dist/fediverse-messages-web.js"
     }
   },
   "files": [

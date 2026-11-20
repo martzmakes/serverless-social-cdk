@@ -28,6 +28,7 @@
 import { createHash } from 'node:crypto'
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { isIP } from 'node:net'
+import { request as httpsRequest } from 'node:https'
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb'
 import {
@@ -38,6 +39,7 @@ import {
   PutCommand,
   DeleteCommand,
   UpdateCommand,
+  TransactWriteCommand,
 } from '@aws-sdk/lib-dynamodb'
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm'
 import {
@@ -61,17 +63,19 @@ import { loadRepoOrThrow } from './pds/repo-root'
 import { normalizeCidsToIpldJson } from './pds/lex-json'
 import { APEX_DID } from './pds/tenant-keys'
 import { verifyXrpcAuth } from './pds/access-verify'
+import { verifyJwt } from './auth/lib/jwt'
 import type { ApFollowingStore, FollowingRow } from './ap/following'
 import type { ApInboundStore, InboundRecord } from './ap/ingest'
+import { privateMessageKey, type MentionRow, type PrivateMentionStore, type PrivateMentionPorts } from './ap/private-mentions'
 import { blueskyOnlyPartition, incomingArticleReplyKey, outgoingRepliesPartition, type ArticleReplyStore, type OutgoingArticleReply } from './ap/article-replies'
 import { wrapCreate } from './ap/outbox'
 import { deliverOne, type DeliverDeps, type DeliveryTransport } from './ap/deliver'
 import { safeSlug } from './pds/longform-routing'
-import type { IndexItem } from './pds/longform-index'
+import { articleFromIndexRow, type ActivityPubLaunch, type IndexItem } from './pds/longform-index'
 import type { AtLongform } from './ap/translate'
 
 import { apKeyRef, getOrMintApKey } from './ap/keys'
-import { parseCustomHosts } from './ap/host'
+import { canonicalApOrigin, parseCustomHosts } from './ap/host'
 import type { ApProfile } from './ap/actor'
 import { verifyRequest, signRequest } from './ap/httpsig'
 // M2: intentional cycle — these are plain top-level primitives (consts/types)
@@ -488,6 +492,33 @@ export async function realDeliverActivity(
   return { status: res.status }
 }
 
+/** Resolve and validate the destination once, then sign over the original HTTPS host. */
+async function deliverPrivateMention(inboxUrl: string, body: Buffer, headers: Record<string, string>) {
+  let addresses: Awaited<ReturnType<DnsLookupAll>> = []
+  await assertSafeRemoteUrlForDelivery(inboxUrl, async host => {
+    addresses = await defaultDnsLookupAll(host)
+    return addresses
+  })
+  return new Promise<{ status: number }>((resolve, reject) => {
+    const request = httpsRequest(inboxUrl, {
+      method: 'POST',
+      headers: { ...headers, 'content-length': body.length },
+      signal: AbortSignal.timeout(REMOTE_FETCH_TIMEOUT_MS),
+      agent: false,
+      lookup: (_hostname, options, callback) => {
+        if (options.all) callback(null, addresses)
+        else callback(null, addresses[0].address, addresses[0].family)
+      },
+    }, response => {
+      resolve({ status: response.statusCode ?? 502 })
+      // A private send never parses or logs the remote response body.
+      response.destroy()
+    })
+    request.on('error', reject)
+    request.end(body)
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Task 11: guarded JSON fetch, following / inbound stores, owner auth
 // ---------------------------------------------------------------------------
@@ -550,6 +581,90 @@ export async function realFetchJson(
 
 type Ddb = { send(cmd: any): Promise<any> }
 const isCondFail = (e: any) => e?.name === 'ConditionalCheckFailedException'
+
+export function makePrivateMentionStore(ddb: Ddb, table: string): PrivateMentionStore {
+  const referenceKey = (id: string) => `REF#${id}`
+  const get = async (did: string, id: string): Promise<MentionRow | undefined> => {
+    const reference = await ddb.send(new GetCommand({
+      TableName: table, Key: { pk: did, sk: referenceKey(id) }, ConsistentRead: true,
+    }))
+    if (!reference.Item?.messageKey) return
+    const item = await ddb.send(new GetCommand({
+      TableName: table, Key: { pk: did, sk: reference.Item.messageKey }, ConsistentRead: true,
+    }))
+    return item.Item?.message
+  }
+
+  return {
+    get,
+    async create(did, row) {
+      const messageKey = privateMessageKey(row)
+      try {
+        await ddb.send(new TransactWriteCommand({
+          TransactItems: [
+            { Put: { TableName: table, Item: { pk: did, sk: referenceKey(row.id), messageKey }, ConditionExpression: 'attribute_not_exists(pk)' } },
+            { Put: { TableName: table, Item: { pk: did, sk: messageKey, message: row }, ConditionExpression: 'attribute_not_exists(pk)' } },
+          ],
+        }))
+        return true
+      } catch (error) {
+        if ((error as Error).name === 'TransactionCanceledException' && await get(did, row.id)) return false
+        throw error
+      }
+    },
+    async replace(did, row) {
+      try {
+        await ddb.send(new PutCommand({
+          TableName: table, Item: { pk: did, sk: privateMessageKey(row), message: row },
+          ConditionExpression: 'message.#version = :previous',
+          ExpressionAttributeNames: { '#version': 'version' },
+          ExpressionAttributeValues: { ':previous': row.version - 1 },
+        }))
+        return true
+      } catch (error) {
+        if (isCondFail(error)) return false
+        throw error
+      }
+    },
+    async list(did, cursor) {
+      const out = await ddb.send(new QueryCommand({
+        TableName: table, KeyConditionExpression: 'pk = :did AND begins_with(sk, :prefix)',
+        ExpressionAttributeValues: { ':did': did, ':prefix': 'MSG#' },
+        ScanIndexForward: false, ConsistentRead: true, Limit: 40,
+        ...(cursor && { ExclusiveStartKey: { pk: did, sk: cursor } }),
+      }))
+      return { messages: (out.Items ?? []).map((item: { message: MentionRow }) => item.message), cursor: out.LastEvaluatedKey?.sk }
+    },
+  }
+}
+
+export function makePrivateMentionAuthenticator(
+  ddb: Ddb, tenantStore: TenantStore, customHosts: string[], verify: typeof verifyJwt = verifyJwt,
+): PrivateMentionPorts['authenticate'] {
+  const domain = process.env.DOMAIN!
+  const hosts = new Set([domain, ...parseCustomHosts(process.env.KNOWN_TENANT_HOSTS)])
+  const admins = (process.env.ALLOWED_EMAILS || process.env.ADMIN_EMAIL || '').split(',').map(email => email.trim())
+  return async (authorization, host, origin) => {
+    const bearer = /^Bearer ([^\s,]+)$/i.exec(authorization ?? '')
+    if (!bearer || !host || !hosts.has(host) || (origin && origin !== `https://${host}`)) return
+    const session = await verify(bearer[1]).catch(() => undefined)
+    if (!session || session.siteHost !== host) return
+
+    if (host === domain) {
+      if (!admins.includes(session.email)) return
+      const apex = await resolveTenant({ did: APEX_DID }, tenantStore)
+      if (apex) return { did: apex.did, handle: apex.handle, origin: canonicalApOrigin(apex.handle, customHosts) }
+      return
+    }
+    const candidate = await resolveTenant({ handle: host }, tenantStore)
+    if (!candidate) return
+    const result = await ddb.send(new GetCommand({
+      TableName: process.env[PDS_ENV.TENANTS_TABLE]!, Key: { did: candidate.did }, ConsistentRead: true,
+    }))
+    if (result.Item?.status !== 'active' || result.Item.handle !== host || result.Item.email !== session.email) return
+    return { did: candidate.did, handle: host, origin: canonicalApOrigin(host, customHosts) }
+  }
+}
 
 /** ApFollowingTable: pk=handle, sk=actorId. */
 export function makeFollowingStore(ddb: Ddb, table: string): ApFollowingStore {
@@ -837,7 +952,10 @@ async function readIndexItems(did: string): Promise<IndexItem[]> {
         ExclusiveStartKey: key,
       }),
     )
-    for (const i of out.Items ?? []) if (i.item) items.push(i.item as IndexItem)
+    for (const row of out.Items ?? []) {
+      const item = articleFromIndexRow(row)
+      if (item) items.push(item)
+    }
     key = out.LastEvaluatedKey
   } while (key)
   return items
@@ -848,9 +966,10 @@ async function readIndexItem(did: string, rkey: string): Promise<IndexItem | nul
     new GetCommand({
       TableName: process.env.LONGFORM_INDEX_TABLE!,
       Key: { pk: idxPk(did), sk: rkey },
+      ConsistentRead: true,
     }),
   )
-  return (out.Item?.item as IndexItem | undefined) ?? null
+  return articleFromIndexRow(out.Item) ?? null
 }
 
 /**
@@ -861,19 +980,22 @@ async function readIndexItem(did: string, rkey: string): Promise<IndexItem | nul
 export interface OutboxIndex {
   slugByRkey: Map<string, string>
   suppressedPostRkeys: Set<string>
+  announcementByRkey?: Map<string, ActivityPubLaunch>
 }
 
 export function outboxIndexFromItems(items: IndexItem[], blueskyOnly: string[] = []): OutboxIndex {
   const slugByRkey = new Map<string, string>()
   const suppressedPostRkeys = new Set(blueskyOnly)
+  const announcementByRkey = new Map<string, ActivityPubLaunch>()
   for (const it of items) {
     if (it.status !== 'published') continue
-    slugByRkey.set(it.rkey, it.currentSlug)
+    if (!it.managedLaunch || it.launchActivityPub) slugByRkey.set(it.rkey, it.currentSlug)
+    if (it.launchActivityPub) announcementByRkey.set(it.rkey, it.launchActivityPub)
     const uri = it.syndication?.bsky?.uri
     const m = typeof uri === 'string' ? /\/app\.bsky\.feed\.post\/([^/]+)$/.exec(uri) : null
     if (m) suppressedPostRkeys.add(m[1])
   }
-  return { slugByRkey, suppressedPostRkeys }
+  return { slugByRkey, suppressedPostRkeys, ...(announcementByRkey.size ? { announcementByRkey } : {}) }
 }
 
 // ---------------------------------------------------------------------------
@@ -973,7 +1095,9 @@ export async function listOutboxFromStorage(
       uri: `at://${did}/${collection}/${e.rkey}`,
       cid: e.cid.toString(),
       value: normalizeCidsToIpldJson(raw),
-      ...(e.tag === 'l' ? { slug: index!.slugByRkey.get(e.rkey) } : {}),
+      ...(e.tag === 'l' ? {
+        slug: index!.slugByRkey.get(e.rkey), announcement: index!.announcementByRkey?.get(e.rkey),
+      } : {}),
     })
   }
   const out: Awaited<ReturnType<ApDeps['listOutbox']>> = { records }
@@ -1009,6 +1133,7 @@ function toAtLongform(v: any): AtLongform | null {
     slug: typeof v.slug === 'string' ? v.slug : '',
     createdAt: typeof v.createdAt === 'string' ? v.createdAt : new Date(0).toISOString(),
     excerpt: typeof v.excerpt === 'string' ? v.excerpt : undefined,
+    ...(v.managedLaunch === true ? { managedLaunch: true } : {}),
   }
 }
 
@@ -1093,6 +1218,8 @@ export function makeRealDeps(): ApDeps {
     marshallOptions: { removeUndefinedValues: true },
   })
   const inboundTable = process.env[AP_ENV.AP_INBOUND_TABLE]!
+  const privateMessagesTable = process.env[AP_ENV.AP_PRIVATE_MESSAGES_TABLE]
+  const customHosts = parseCustomHosts(process.env.AP_CUSTOM_HOSTS)
   const blueskyOnly = makeBlueskyOnlyIndex(ddb, inboundTable)
   const outboxIndex = async (did: string) => {
     const [items, hidden] = await Promise.all([readIndexItems(did), blueskyOnly.keys(did)])
@@ -1137,16 +1264,23 @@ export function makeRealDeps(): ApDeps {
       ? null : getOutboxPostFromStorage(repoStorageFor(did), did, rkey),
     getArticle: async (did, rkey) => {
       const item = await readIndexItem(did, rkey)
-      if (!item || item.status !== 'published') return null
+      if (!item || item.status !== 'published' || (item.managedLaunch && !item.launchActivityPub)) return null
       const record = await loadLongformFromStorage(repoStorageFor(did), did, rkey)
-      return record ? { record, slug: item.currentSlug } : null
+      return record ? { record, slug: item.currentSlug, announcement: item.launchActivityPub } : null
     },
     retryQueue: process.env[AP_ENV.AP_RETRY_QUEUE_URL] ? retryQueue : undefined,
-    customHosts: parseCustomHosts(process.env.AP_CUSTOM_HOSTS),
+    customHosts,
     getProfile: (did) => getProfileFromStorage(repoStorageFor(did), did),
     following: makeFollowingStore(ddb, process.env[AP_ENV.AP_FOLLOWING_TABLE]!),
     inbound: makeInboundStore(ddb, inboundTable),
     articleReplies: makeArticleReplyStore(ddb, inboundTable),
+    ...(privateMessagesTable ? { privateMentions: {
+      store: makePrivateMentionStore(ddb, privateMessagesTable),
+      authenticate: makePrivateMentionAuthenticator(ddb, tenantStore, customHosts),
+      fetchJson: realFetchJson,
+      fetchActorJson: (url, actor) => realFetchJson(url, defaultDnsLookupAll, signActorLookup(actor)),
+      signRequest, getApKey, deliver: deliverPrivateMention,
+    } satisfies PrivateMentionPorts } : {}),
     deliverArticleReply: async (handle, actor, reply) => {
       const create = wrapCreate(actor, reply.note)
       const key = `${create.id}|${reply.inbox}`
@@ -1401,7 +1535,10 @@ export function makeDeliverDeps(): DeliverDeps {
       loadLongformFromStorage(repoStorageFor(did), did, rkey),
     getLongformIndex: async (did, rkey) => {
       const it = await readIndexItem(did, rkey)
-      return it ? { slug: it.currentSlug, cid: it.cid, status: it.status } : null
+      return it ? {
+        slug: it.currentSlug, cid: it.cid, status: it.status,
+        managedLaunch: it.managedLaunch, announcement: it.launchActivityPub,
+      } : null
     },
     isSyndicationLink: async (did, rkey, embedUri, pageOrigin) =>
       isSyndicationLinkFrom({
