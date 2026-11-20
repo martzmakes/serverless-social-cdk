@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useRef, useState, type CSSProperties, type FormEvent } from "react";
 import {
-  DirectMessagesError, MESSAGE_MAX_GRAPHEMES, messageLength, messageTooLong,
+  DirectMessagesError, MESSAGE_MAX_GRAPHEMES, conversationRequestState, messageLength, messageTooLong,
   type ChatProfile, type Conversation, type ConversationPage, type DirectMessage,
   type DirectMessagesClient, type MessagePage,
 } from "./direct-messages";
@@ -97,7 +97,7 @@ function problemText(error: unknown) {
 type Composer = { text: string; status?: "busy" | "sent" | "uncertain"; error?: string };
 
 function Thread({
-  client, actor, conversation, composer, updateComposer, onBack, onSent,
+  client, actor, conversation, composer, updateComposer, onBack, onSent, onAccepted,
 }: {
   client: DirectMessagesClient;
   actor: ChatProfile;
@@ -106,20 +106,25 @@ function Thread({
   updateComposer: (update: (previous: Composer) => Composer) => void;
   onBack: () => void;
   onSent: (message: DirectMessage) => void;
+  onAccepted: () => void;
 }) {
   const [page, setPage] = useState<MessagePage>();
   const [loading, setLoading] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [refresh, setRefresh] = useState(0);
   const [readError, setReadError] = useState("");
+  const [accepting, setAccepting] = useState(false);
+  const [acceptError, setAcceptError] = useState("");
   const heading = useRef<HTMLHeadingElement>(null);
   const history = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
   const scrollAfterRender = useRef<number | undefined>(undefined);
   const fieldId = useId();
   const countId = useId();
   const { id } = conversation;
   const { text, status: sendState, error: sendError } = composer;
   const tooLong = messageTooLong(text);
+  const requestState = conversationRequestState(conversation, page);
 
   useEffect(() => { heading.current?.focus({ preventScroll: true }); }, []);
 
@@ -169,7 +174,8 @@ function Thread({
 
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!page || sendState === "busy" || sendState === "uncertain" || loading || !text.trim() || tooLong) return;
+    if (!page || conversation.locked || requestState === "incoming" || sendState === "busy" ||
+        sendState === "uncertain" || loading || !text.trim() || tooLong) return;
     updateComposer(() => ({ text, status: "busy" }));
     try {
       const result = await client.send(id, text);
@@ -185,6 +191,22 @@ function Thread({
     }
   }
 
+  async function acceptRequest() {
+    if (accepting || requestState !== "incoming" || conversation.locked) return;
+    setAccepting(true);
+    setAcceptError("");
+    try {
+      const result = await client.accept(id);
+      if (!result.accepted) throw new Error("Bluesky did not confirm the request");
+      onAccepted();
+      requestAnimationFrame(() => input.current?.focus());
+    } catch (error) {
+      setAcceptError(problemText(error));
+    } finally {
+      setAccepting(false);
+    }
+  }
+
   const people = new Map([...conversation.participants, ...(page?.profiles ?? [])].map(person => [person.did, person]));
   const others = conversation.participants.filter(person => person.did !== actor.did);
   const peer = others.length === 1 ? others[0] : undefined;
@@ -196,7 +218,7 @@ function Thread({
       <div className="ss-dm-toolbar">
         <h3 ref={heading} tabIndex={-1}>{conversationLabel(conversation, actor)}</h3>
         <button type="button" onClick={() => setRefresh(value => value + 1)}
-          disabled={loading || loadingOlder || sendState === "busy"}>{loading ? "Refreshing…" : "Refresh conversation"}</button>
+          disabled={loading || loadingOlder || accepting || sendState === "busy"}>{loading ? "Refreshing…" : "Refresh conversation"}</button>
       </div>
       <p className="ss-dm-meta">
         {peer?.displayName && `@${peer.handle} · `}
@@ -224,13 +246,20 @@ function Thread({
         })}
       </ol>
     </div>
-    {conversation.status === "request" || conversation.locked
-      ? <div className="ss-dm-panel">
-        <p>{conversation.locked ? "This conversation is locked on Bluesky." : "Open this message request in Bluesky to respond."}</p>
+    {conversation.locked && <div className="ss-dm-panel"><p>This conversation is locked on Bluesky.</p></div>}
+    {!conversation.locked && requestState === "incoming" && <div className="ss-dm-panel">
+      <p>Accept this request to reply on Bluesky.</p>
+      {acceptError && <p role="alert" className="ss-dm-error">{acceptError}</p>}
+      <div className="ss-dm-actions">
+        <button type="button" className="ss-dm-primary" disabled={accepting} onClick={() => void acceptRequest()}>
+          {accepting ? "Accepting…" : "Accept request"}
+        </button>
       </div>
-      : <form className="ss-dm-compose" onSubmit={event => void send(event)}>
+    </div>}
+    {!conversation.locked && (requestState === undefined || requestState === "outgoing") &&
+      <form className="ss-dm-compose" onSubmit={event => void send(event)}>
         <label htmlFor={fieldId}>Message</label>
-        <textarea id={fieldId} rows={3} value={text} placeholder="Write a message…" autoComplete="off" maxLength={10_000}
+        <textarea ref={input} id={fieldId} rows={3} value={text} placeholder="Write a message…" autoComplete="off" maxLength={10_000}
           onChange={event => {
             const text = event.target.value;
             updateComposer(previous => ({ ...previous, text, status: previous.status === "sent" ? undefined : previous.status }));
@@ -407,7 +436,7 @@ export function DirectMessages({ client, accent = "#346ef3" }: { client: DirectM
               {conversation.lastMessage && <time className="ss-dm-meta" dateTime={conversation.lastMessage.sentAt}>
                 {previewDate.format(new Date(conversation.lastMessage.sentAt))}
               </time>}
-              <span className="ss-dm-preview">{conversation.status === "request" ? "Message request · " : ""}{content(conversation.lastMessage)}</span>
+              <span className="ss-dm-preview">{conversationRequestState(conversation) === "incoming" ? "Message request · " : ""}{content(conversation.lastMessage)}</span>
             </button>
           </li>)}
         </ul>
@@ -417,10 +446,15 @@ export function DirectMessages({ client, accent = "#346ef3" }: { client: DirectM
         composer={drafts.get(selected.id) ?? { text: "" }}
         updateComposer={updateSelectedComposer}
         onBack={() => { setSelectedId(undefined); requestAnimationFrame(() => listScope.current?.focus()); }}
+        onAccepted={() => updatePage(previous => ({
+          ...previous,
+          conversations: previous.conversations.map(row => row.id === selected.id ? { ...row, status: "accepted" } : row),
+        }))}
         onSent={message => updatePage(previous => {
           const conversation = previous.conversations.find(row => row.id === selected.id);
           if (!conversation) return previous;
-          return { ...previous, conversations: [{ ...conversation, lastMessage: message }, ...previous.conversations.filter(row => row.id !== selected.id)] };
+          const updated: Conversation = { ...conversation, status: "accepted", lastMessage: message };
+          return { ...previous, conversations: [updated, ...previous.conversations.filter(row => row.id !== selected.id)] };
         })} /> : <p className="ss-dm-empty">Choose a conversation or start a new message.</p>}
     </div>}
   </div>;

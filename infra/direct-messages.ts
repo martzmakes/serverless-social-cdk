@@ -23,12 +23,23 @@ export type Conversation = {
   id: string;
   participants: ChatProfile[];
   name?: string;
+  kind?: "direct" | "group";
   status?: "accepted" | "request";
   locked?: boolean;
   lastMessage?: DirectMessage;
 };
 export type ConversationPage = { actor: ChatProfile; conversations: Conversation[]; next?: string };
 export type MessagePage = { messages: DirectMessage[]; profiles: ChatProfile[]; next?: string };
+
+export function conversationRequestState(conversation: Conversation, page?: Pick<MessagePage, "messages" | "next">) {
+  if (conversation.status !== "request") return;
+  const direct = conversation.kind === "direct" ||
+    (!conversation.kind && !conversation.name && conversation.participants.length === 2);
+  // Bluesky leaves a new direct conversation in request status until its
+  // initiator sends the first message. An empty group request needs acceptance.
+  if (!direct || conversation.lastMessage || page?.messages.length || page?.next) return "incoming";
+  return page ? "outgoing" : "loading";
+}
 export type MessageErrorCode =
   | "sign_in" | "site_session_required" | "site_identity_required"
   | "invalid_input" | "recipient_unavailable" | "conversation_unavailable"
@@ -98,6 +109,8 @@ export function createDirectMessagesClient(token: TokenGetter, baseUrl?: string)
       request<MessagePage>(`/conversations/${encodeURIComponent(id)}`, { cursor, signal }),
     open: (handle: string, signal?: AbortSignal) =>
       request<{ conversation: Conversation }>("/conversations", { body: { handle }, signal }),
+    accept: (id: string) =>
+      request<{ accepted: true }>(`/conversations/${encodeURIComponent(id)}`, { body: { action: "accept" } }),
     send: (id: string, text: string) =>
       request<{ message: DirectMessage }>(`/conversations/${encodeURIComponent(id)}`, {
         body: { text }, sending: true,

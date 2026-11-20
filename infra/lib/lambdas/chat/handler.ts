@@ -72,7 +72,8 @@ export function createDirectMessageHandler(deps: HandlerDeps) {
     }
     const httpMethod = event.requestContext.http.method;
     const path = event.rawPath;
-    const isSend = httpMethod === "POST" && path.startsWith(`${conversationsPath}/`);
+    const isConversationPost = httpMethod === "POST" && path.startsWith(`${conversationsPath}/`);
+    const isAccept = isConversationPost && postValue(event, "action") === "accept";
     try {
       const actor = await deps.actorFor(session.email, host);
       if (!actor) {
@@ -92,6 +93,10 @@ export function createDirectMessageHandler(deps: HandlerDeps) {
         if (!validConversationId(id)) return invalid("Invalid conversation.");
         if (httpMethod === "GET") return json(200, await chat.messages(actor.did, id, query.cursor));
         if (httpMethod === "POST") {
+          if (isAccept) {
+            await chat.accept(actor.did, id);
+            return json(200, { accepted: true });
+          }
           const message = postValue(event, "text");
           if (!message?.trim()) return invalid("Write a message before sending.");
           if (messageTooLong(message)) return invalid(`Use up to ${MESSAGE_MAX_GRAPHEMES.toLocaleString("en-US")} characters per message.`);
@@ -102,7 +107,7 @@ export function createDirectMessageHandler(deps: HandlerDeps) {
     } catch (error) {
       if (error instanceof ChatFailure) return failure(error.status, error.code, error.message);
       // AWS and upstream exceptions may contain private request details.
-      return isSend
+      return isConversationPost && !isAccept
         ? failure(503, "send_uncertain", "Delivery could not be confirmed. Refresh the conversation before trying again.")
         : failure(503, "chat_unavailable", "Could not load your Bluesky messages. Try again shortly.");
     }

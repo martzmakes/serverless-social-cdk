@@ -15,6 +15,7 @@ const METHODS = {
   list: "chat.bsky.convo.listConvos",
   messages: "chat.bsky.convo.getMessages",
   open: "chat.bsky.convo.getConvoForMembers",
+  accept: "chat.bsky.convo.acceptConvo",
   send: "chat.bsky.convo.sendMessage",
 } as const;
 
@@ -123,10 +124,12 @@ function conversation(value: unknown, actor: string): Conversation {
   if (!participants.some(member => member.did === actor)) throw unavailable();
   const status = row.status === "request" || row.status === "accepted" ? row.status : undefined;
   const group = record(row.kind);
+  const kind = group.$type === `${DEFS}#groupConvo` ? "group"
+    : group.$type === `${DEFS}#directConvo` ? "direct" : undefined;
   const name = typeof group.name === "string" && group.name.trim() ? group.name : undefined;
   const lock = group.lockStatus;
   return {
-    id, participants, name, status,
+    id, participants, name, kind, status,
     locked: lock === "locked" || lock === "locked-permanently",
     lastMessage: row.lastMessage ? message(row.lastMessage) : undefined,
   };
@@ -213,6 +216,9 @@ export function createBlueskyChat({
       } catch {
         throw sendUncertain();
       }
+    },
+    async accept(actor: string, id: string) {
+      await call(actor, METHODS.accept, undefined, { convoId: id });
     },
   };
 }

@@ -3,7 +3,10 @@ import { join } from "node:path";
 import type { APIGatewayProxyEventV2 } from "aws-lambda";
 import { Secp256k1Keypair } from "@atproto/crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDirectMessagesClient, MESSAGES_PATH, messageLength, messageTooLong } from "../direct-messages";
+import {
+  conversationRequestState, createDirectMessagesClient, MESSAGES_PATH, messageLength, messageTooLong,
+  type Conversation, type DirectMessage,
+} from "../direct-messages";
 import { createBlueskyChat, type BlueskyChat } from "../lib/lambdas/chat/bluesky";
 import { createDirectMessageHandler } from "../lib/lambdas/chat/handler";
 import { serviceAuthJwt } from "../lib/lambdas/pds/appview-proxy";
@@ -49,6 +52,7 @@ function stubApp() {
     messages: vi.fn(async () => ({ messages: [], profiles: [], next: undefined })),
     open: vi.fn(),
     send: vi.fn(),
+    accept: vi.fn(),
   } satisfies BlueskyChat;
   const actorFor = vi.fn(async (email: string, host: string) => {
     if (email !== owner) return undefined;
@@ -115,6 +119,7 @@ describe("site-scoped Bluesky messages", () => {
       createEvent({ method: "POST", path, params, body: { text: " " } }),
       createEvent({ method: "POST", path, params, body: { text: "a".repeat(1001) } }),
       createEvent({ method: "POST", path, params, body: { text: "hi", did: tenant.did } }),
+      createEvent({ method: "POST", path, params, body: { text: "hi", action: "accept" } }),
     ]) {
       expect(await handle(event)).toMatchObject({ statusCode: 400, body: expect.stringContaining("invalid_input") });
     }
@@ -146,6 +151,22 @@ describe("site-scoped Bluesky messages", () => {
     expect(result).toMatchObject({ statusCode: 503, body: expect.stringContaining("send_uncertain") });
     expect(result.body).not.toContain("private diagnostic");
     expect(result.body).not.toContain(wire.sent.text);
+  });
+
+  it("only dispatches an explicit acceptance for the signed-in site's actor", async () => {
+    const { handle, chat } = stubApp();
+    const path = `${MESSAGES_PATH}/conversations/${conversationId}`;
+    const params = { conversationId };
+    await expect(handle(createEvent({
+      method: "POST", host: tenant.handle, path, params, body: { action: "accept" },
+    }))).resolves.toMatchObject({ statusCode: 403 });
+    expect(chat.accept).not.toHaveBeenCalled();
+    const result = await handle(createEvent({
+      method: "POST", host: tenant.handle, token: "tenant", path, params, body: { action: "accept" },
+    }));
+    expect(result).toMatchObject({ statusCode: 200, body: JSON.stringify({ accepted: true }) });
+    expect(chat.accept).toHaveBeenCalledWith(tenant.did, conversationId);
+    expect(chat.send).not.toHaveBeenCalled();
   });
 });
 
@@ -212,9 +233,42 @@ describe("Bluesky Chat XRPC", () => {
     await expect(chat.send(wire.actor.did, conversationId, wire.sent.text)).rejects.toMatchObject({ status: 503, code: "send_uncertain" });
     await expect(chat.messages(wire.actor.did, conversationId)).rejects.toMatchObject({ status: 403, code: "conversation_unavailable" });
   });
+
+  it("projects direct and group kinds and accepts through the separate Bluesky procedure", async () => {
+    const inbox = [{ ...conversation, status: "request", kind: { $type: "chat.bsky.convo.defs#groupConvo", name: "Fixture group" } },
+      { ...conversation, status: "request", lastMessage: undefined, kind: { $type: "chat.bsky.convo.defs#directConvo" } }];
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json({ convos: inbox }))
+      .mockResolvedValueOnce(Response.json({ rev: "accepted-revision" }));
+    const sign = vi.fn(async () => "signed-fixture");
+    const chat = createBlueskyChat({ fetcher, sign });
+    const { conversations } = await chat.list(wire.actor.did);
+    expect(conversations.map(row => row.kind)).toEqual(["group", "direct"]);
+    await chat.accept(wire.actor.did, conversationId);
+    expect(sign).toHaveBeenLastCalledWith(wire.actor.did, "chat.bsky.convo.acceptConvo", "did:web:api.bsky.chat");
+    expect(fetcher).toHaveBeenLastCalledWith(new URL("https://api.bsky.chat/xrpc/chat.bsky.convo.acceptConvo"),
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ convoId: conversationId }) }));
+  });
 });
 
 describe("browser message gateway", () => {
+  it("distinguishes a new empty outgoing direct chat from incoming requests and incomplete history", () => {
+    const recipient = { did: wire.peer.did, handle: wire.peer.handle };
+    const outgoing: Conversation = {
+      id: conversationId, participants: [wire.actor, recipient], status: "request", kind: "direct",
+    };
+    const incomingMessage: DirectMessage = {
+      kind: "text", id: wire.message.id, senderDid: recipient.did, text: wire.message.text, sentAt: wire.message.sentAt,
+    };
+    expect(conversationRequestState(outgoing)).toBe("loading");
+    expect(conversationRequestState(outgoing, { messages: [] })).toBe("outgoing");
+    expect(conversationRequestState({ ...outgoing, kind: undefined }, { messages: [] })).toBe("outgoing");
+    expect(conversationRequestState(outgoing, { messages: [], next: "earlier" })).toBe("incoming");
+    expect(conversationRequestState(outgoing, { messages: [incomingMessage] })).toBe("incoming");
+    expect(conversationRequestState({ ...outgoing, lastMessage: incomingMessage })).toBe("incoming");
+    expect(conversationRequestState({ ...outgoing, kind: "group" }, { messages: [] })).toBe("incoming");
+    expect(conversationRequestState({ ...outgoing, status: "accepted" })).toBeUndefined();
+  });
+
   it("only sends a bearer session to the private API and never retries a send", async () => {
     const fetcher = vi.fn<typeof fetch>().mockRejectedValue(new Error("fixture lost response"));
     vi.stubGlobal("fetch", fetcher);
