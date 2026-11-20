@@ -67,9 +67,11 @@ import { verifyJwt } from './auth/lib/jwt'
 import type { ApFollowingStore, FollowingRow } from './ap/following'
 import type { ApInboundStore, InboundRecord } from './ap/ingest'
 import { privateMessageKey, type MentionRow, type PrivateMentionStore, type PrivateMentionPorts } from './ap/private-mentions'
-import { blueskyOnlyPartition, incomingArticleReplyKey, outgoingRepliesPartition, type ArticleReplyStore, type OutgoingArticleReply } from './ap/article-replies'
+import { blueskyOnlyPartition, incomingArticleReplyKey, outgoingRepliesPartition, replyContentDigest, type ArticleReplyStore, type OutgoingArticleReply } from './ap/article-replies'
 import { wrapCreate } from './ap/outbox'
 import { deliverOne, type DeliverDeps, type DeliveryTransport } from './ap/deliver'
+import { TID } from '@atproto/common-web'
+import { blueskyLink, postBluesky, ReplyActionError, type BlueIntent, type Ref } from './analytics/reply-actions'
 import { safeSlug } from './pds/longform-routing'
 import { articleFromIndexRow, type ActivityPubLaunch, type IndexItem } from './pds/longform-index'
 import type { AtLongform } from './ap/translate'
@@ -746,6 +748,10 @@ function rowFromItem(i: Record<string, any>): FollowingRow {
  */
 export function makeInboundStore(ddb: Ddb, table: string): ApInboundStore {
   return {
+    async get(handle, key) {
+      const { Item } = await ddb.send(new GetCommand({ TableName: table, Key: { pk: handle, sk: key }, ConsistentRead: true }))
+      return Item ? { key, owner: Item.owner, sortKey: Item.sortKey, item: Item.item, ttl: Item.ttl } : undefined
+    },
     async putIfAbsent(handle, rec) {
       try {
         await ddb.send(
@@ -1281,6 +1287,47 @@ export function makeRealDeps(): ApDeps {
       fetchActorJson: (url, actor) => realFetchJson(url, defaultDnsLookupAll, signActorLookup(actor)),
       signRequest, getApKey, deliver: deliverPrivateMention,
     } satisfies PrivateMentionPorts } : {}),
+    sendBlueskyInboxReply: async ({ did, origin, token, post, requestId, text }) => {
+      if (!blueskyLink(post)) throw new ReplyActionError(400, 'Choose a valid Bluesky post')
+      const key = { pk: `ap-bluesky-replies#${did}`, sk: requestId }
+      const fingerprint = replyContentDigest('Bluesky', 'following', post, text)
+      async function read() {
+        const { Item } = await ddb.send(new GetCommand({ TableName: inboundTable, Key: key, ConsistentRead: true }))
+        return Item as BlueIntent | undefined
+      }
+      let intent = await read()
+      if (!intent) {
+        const url = new URL('https://public.api.bsky.app/xrpc/app.bsky.feed.getPosts')
+        url.searchParams.set('uris', post)
+        const result = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(4500) })
+        if (!result.ok) throw new ReplyActionError(503, 'Could not load this Bluesky post')
+        const { posts } = await result.json() as {
+          posts?: (Ref & { record?: { reply?: { root?: Ref } } })[]
+        }
+        const source = posts?.find(item => item.uri === post)
+        const root = source?.record?.reply ? source.record.reply.root : source
+        const cid = /^b[a-z2-7]{20,120}$/
+        if (!source || !root || !blueskyLink(root.uri) || !cid.test(source.cid) || !cid.test(root.cid)) {
+          throw new ReplyActionError(422, 'This Bluesky thread is unavailable')
+        }
+        const proposed: BlueIntent = {
+          fingerprint, rkey: TID.nextStr(), record: {
+            $type: 'app.bsky.feed.post', text, createdAt: new Date().toISOString(),
+            reply: { parent: { uri: source.uri, cid: source.cid }, root: { uri: root.uri, cid: root.cid } },
+          },
+        }
+        try {
+          await ddb.send(new PutCommand({ TableName: inboundTable, Item: { ...key, ...proposed },
+            ConditionExpression: 'attribute_not_exists(sk)' }))
+          intent = proposed
+        } catch (error) {
+          if (!isCondFail(error)) throw error
+          intent = await read()
+        }
+      }
+      if (intent?.fingerprint !== fingerprint) throw new ReplyActionError(409, 'This reply request has already been used')
+      return postBluesky({ ddb, inboundTable, apiOrigin: origin }, { did }, token, intent)
+    },
     deliverArticleReply: async (handle, actor, reply) => {
       const create = wrapCreate(actor, reply.note)
       const key = `${create.id}|${reply.inbox}`

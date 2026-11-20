@@ -24,9 +24,9 @@ export function blueskyLink(uri: string) {
 
 type ReplyTarget = Pick<ArticleReply, "id" | "network">;
 type TeamContext = { entitlements: ResolveDeps; analyticsTable: string; inboundTable: string; apiOrigin: string };
-type Ref = { uri: string; cid: string };
-type BlueRecord = { $type: string; text: string; createdAt: string; reply: { root: Ref; parent: Ref } };
-type BlueIntent = { fingerprint: string; rkey: string; record: BlueRecord };
+export type Ref = { uri: string; cid: string };
+export type BlueRecord = { $type: string; text: string; createdAt: string; reply: { root: Ref; parent: Ref } };
+export type BlueIntent = { fingerprint: string; rkey: string; record: BlueRecord };
 type ReplyIntent = { action: "send"; requestId: string; text: string } | { action: "handled"; handled: boolean };
 
 export class ReplyActionError extends Error {
@@ -134,7 +134,7 @@ async function reserveBlueskyReply(context: TeamContext, site: InsightSite, item
   return intent;
 }
 
-async function appRequest(context: TeamContext, path: string, token: string, body?: object, timeout = 8_000) {
+async function appRequest(context: Pick<TeamContext, "apiOrigin">, path: string, token: string, body?: object, timeout = 8_000) {
   return fetch(new URL(path, context.apiOrigin), {
     method: body ? "POST" : "GET", redirect: "error", signal: AbortSignal.timeout(timeout),
     headers: { Authorization: `Bearer ${token}`, ...(body ? { "Content-Type": "application/json" } : {}) },
@@ -142,12 +142,12 @@ async function appRequest(context: TeamContext, path: string, token: string, bod
   });
 }
 
-async function postBluesky(context: TeamContext, site: InsightSite, token: string, intent: BlueIntent): Promise<ReplySubmission> {
+export async function postBluesky(context: Pick<TeamContext, "apiOrigin" | "inboundTable"> & { ddb: ResolveDeps["ddb"] }, site: Pick<InsightSite, "did">, token: string, intent: BlueIntent): Promise<ReplySubmission> {
   const { rkey, record } = intent;
   const uri = `at://${site.did}/${collection}/${rkey}`;
   // Write the protocol selection before the repo record. The ActivityPub stream
   // can see that record as soon as the PDS commits it.
-  await context.entitlements.ddb.send(new PutCommand({
+  await context.ddb.send(new PutCommand({
     TableName: context.inboundTable, Item: { pk: blueskyOnlyPartition(site.did), sk: rkey },
   }));
   let written = false;
@@ -208,5 +208,5 @@ export async function applyReplyAction(context: TeamContext, email: string, site
   if (!session || session.did !== site.did) throw new ReplyActionError(403, "This publishing identity is unavailable.");
   if (action.network === "Fediverse") return postFediverse(context, site, item, session.accessJwt, action);
   const intent = await reserveBlueskyReply(context, site, item, action.id, action.requestId, action.text);
-  return postBluesky(context, site, session.accessJwt, intent);
+  return postBluesky({ ...context, ddb: context.entitlements.ddb }, site, session.accessJwt, intent);
 }

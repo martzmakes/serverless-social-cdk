@@ -39,7 +39,7 @@ export interface ArticleReplyStore {
 }
 
 export function makeArticleReply(
-  actor: string, requestId: string, articleRkey: string, parent: InboundRecord, inbox: string, text: string,
+  actor: string, requestId: string, articleRkey: string, parent: Pick<InboundRecord, 'owner' | 'item'>, inbox: string, text: string,
 ): OutgoingArticleReply {
   const id = `${actor}/replies/${requestId}`
   const recipient = new URL(parent.owner)

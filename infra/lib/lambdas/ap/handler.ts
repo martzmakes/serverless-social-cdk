@@ -87,6 +87,7 @@ import {
   buildTimeline,
   ingestActivity,
   ingestArticleReply,
+  noteKey,
   type ApInboundStore,
 } from './ingest'
 import {
@@ -94,6 +95,9 @@ import {
   type ArticleReplyStore, type OutgoingArticleReply,
 } from './article-replies'
 import { safeHttpsUrl } from './sanitize'
+import { followedPost, publicReplies, readPublicPost } from './following-thread'
+import { ReplyActionError } from '../analytics/reply-actions'
+import type { ReplySubmission } from '../../../insights'
 import { FEDIVERSE_MESSAGES_PATH } from '../../../fediverse-messages'
 import {
   ingestPrivateMention, parsePrivateMention, privateMessageView, sendPrivateMention,
@@ -233,6 +237,7 @@ export interface ApDeps {
   /** Ingested posts from accepted followees. */
   inbound?: ApInboundStore
   articleReplies?: ArticleReplyStore
+  sendBlueskyInboxReply?(input: { did: string; origin: string; token: string; post: string; requestId: string; text: string }): Promise<ReplySubmission>
   privateMentions?: PrivateMentionPorts
   deliverArticleReply?(handle: string, actor: string, reply: OutgoingArticleReply): Promise<DeliveryOutcome>
   /**
@@ -978,6 +983,72 @@ async function sendArticleReply(req: ApRequest, tenant: Tenant, origin: string, 
   return { ...result, headers: { 'cache-control': 'private, no-store' } }
 }
 
+async function handleFollowingThread(
+  req: ApRequest, tenant: Tenant, origin: string, deps: ApDeps,
+): Promise<ApResult> {
+  if (!deps.inbound?.get || !deps.following || !deps.fetchJson || !deps.articleReplies || !deps.deliverArticleReply) {
+    return err(501, 'NotImplemented', 'Followed-post threads are unavailable')
+  }
+  const respond = (status: number, data: unknown) => ({
+    ...json(status, data, 'application/json'), headers: { 'cache-control': 'private, no-store' },
+  })
+  const { handle } = tenant
+  const actor = `${origin}/ap/users/${handle}`
+  const fetchJson: FetchJson = url => deps.fetchActorJson ? deps.fetchActorJson(url, { handle, origin }) : deps.fetchJson!(url)
+  if (req.method === 'GET') {
+    const selected = await followedPost(handle, req.query.post, deps.inbound, deps.following)
+    if (!selected) return err(422, 'Unavailable', 'That post is unavailable in your timeline')
+    const root = await readPublicPost(selected.url, selected.item, fetchJson).catch(() => undefined)
+    if (!root) return respond(200, { replies: [], canReply: false, partial: true })
+    const thread = await publicReplies(root, fetchJson).catch(() => ({ items: [], partial: true }))
+    return respond(200, { replies: thread.items, canReply: root.public, partial: thread.partial })
+  }
+  if (req.method !== 'POST') return err(405, 'MethodNotAllowed', 'Method not allowed')
+  const body = parseOwnerBody(req, 7000)
+  if ('error' in body) return body.error
+  const { network, post, requestId, text } = body.value
+  if (network === 'Bluesky') {
+    const token = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? '')?.[1]
+    if (!token || !deps.sendBlueskyInboxReply) return err(503, 'Unavailable', 'Bluesky replies are unavailable')
+    if (typeof post !== 'string' || post.length > 2048 || typeof requestId !== 'string' ||
+        !replyRequestId.test(requestId) || !validReplyText(text)) {
+      return err(400, 'BadRequest', 'Choose a post and enter up to 300 characters')
+    }
+    const result = await deps.sendBlueskyInboxReply({ did: tenant.did, origin, token, post, requestId, text: text.trim() })
+      .catch(error => error instanceof ReplyActionError
+        ? error : new ReplyActionError(503, 'Could not confirm the Bluesky reply. Retry the same submission.'))
+    return result instanceof ReplyActionError ? err(result.status, 'ReplyError', result.message) : respond(200, result)
+  }
+  if (!safeHttpsUrl(post, 2048) || typeof requestId !== 'string' || !replyRequestId.test(requestId) || !validReplyText(text)) {
+    return err(400, 'BadRequest', 'Choose a post and enter up to 300 characters')
+  }
+  const key = `following:${noteKey(post)}`
+  const message = text.trim()
+  const fingerprint = replyContentDigest('Fediverse', key, post, message)
+  let reply = await deps.articleReplies.outgoing(handle, requestId)
+  if (!reply) {
+    const selected = await followedPost(handle, post, deps.inbound, deps.following)
+    if (!selected) return err(422, 'Unavailable', 'That post is unavailable in your timeline')
+    const root = await readPublicPost(selected.url, selected.item, fetchJson).catch(() => undefined)
+    if (!root?.public) return err(422, 'Unavailable', 'Only public posts can receive a reply from this Inbox')
+    const author = selected.item.actor.id
+    const remote = await deps.fetchRemoteActor(author, { handle, origin }).catch(() => undefined)
+    if (!remote || remote.id !== author || !safeHttpsUrl(remote.inbox)) {
+      return err(422, 'Unavailable', 'The remote actor could not be verified')
+    }
+    const proposed = { ...makeArticleReply(actor, requestId, key,
+      { owner: author, item: { ...selected.item, id: root.id } }, remote.inbox, message), fingerprint }
+    reply = await deps.articleReplies.putOutgoing(handle, proposed) ? proposed : await deps.articleReplies.outgoing(handle, requestId)
+  }
+  if (reply?.fingerprint !== fingerprint) return err(409, 'Conflict', 'This reply request has already been used')
+  const outcome = await deps.deliverArticleReply(handle, actor, reply)
+  if (outcome === 'gone' || outcome === 'rejected') {
+    return err(422, 'Rejected', 'The remote server did not accept the reply')
+  }
+  const sent = outcome === 'delivered'
+  return respond(sent ? 200 : 202, { url: reply.note.id, status: sent ? 'sent' : 'queued' })
+}
+
 async function handleOwnerRoute(
   handle: string,
   sub: string,
@@ -1005,6 +1076,8 @@ async function handleOwnerRoute(
   const t = tenant!
   const origin = canonicalApOrigin(t.handle, customHosts)
   const ourActorId = `${origin}/ap/users/${t.handle}`
+
+  if (sub === '/timeline/thread') return handleFollowingThread(req, t, origin, deps)
 
   if (sub === '/timeline') {
     if (method !== 'GET') return err(405, 'MethodNotAllowed', 'Method not allowed')
@@ -1160,7 +1233,7 @@ export async function dispatch(
       const sub = apMatch[2] ?? ''
 
       // Owner-authenticated following + timeline (+ the public /following GET).
-      if (/^\/(following(\/[^/]+)?|timeline)$/.test(sub)) {
+      if (/^\/(following(\/[^/]+)?|timeline(\/thread)?)$/.test(sub)) {
         return await handleOwnerRoute(handle, sub, req, deps)
       }
 

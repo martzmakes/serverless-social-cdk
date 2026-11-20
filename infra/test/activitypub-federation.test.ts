@@ -141,6 +141,10 @@ describe('Following a Mastodon account from the sites', () => {
     vi.stubGlobal('fetch', lookup)
     const following = new Map<string, FollowingRow>()
     const entries = new Map<string, InboundRecord>()
+    const outgoing = new Map<string, OutgoingArticleReply>()
+    const commentId = remote + '/statuses/comment'
+    const send = vi.fn(async () => 'delivered' as const)
+    const sendBluesky = vi.fn(async () => ({ status: 'sent' as const, url: 'https://bsky.app/profile/test/post/3test' }))
     let followId = ''
     const deps: ApDeps = {
       tenantStore: {
@@ -185,7 +189,15 @@ describe('Following a Mastodon account from the sites', () => {
         remove: async () => {},
         list: async () => [...following.values()],
       },
+      articleReplies: {
+        incoming: async () => undefined,
+        outgoing: async (_handle, id) => outgoing.get(id),
+        putOutgoing: async (_handle, value) => { outgoing.set(value.requestId, value); return true },
+      },
+      deliverArticleReply: send,
+      sendBlueskyInboxReply: sendBluesky,
       inbound: {
+        get: async (owner, key) => entries.get(owner + ':' + key),
         putIfAbsent: async (owner, row) => {
           const key = owner + ':' + row.key
           if (entries.has(key)) return false
@@ -231,6 +243,34 @@ describe('Following a Mastodon account from the sites', () => {
     expect(JSON.parse(response.body)).toMatchObject({
       items: [{ id: postId, actor: { id: remote }, content: '<p>A standalone QA post</p>' }],
     })
+    deps.fetchActorJson = vi.fn(async target => {
+      if (target === postId) return { ...post.object, replies: { items: [commentId] } }
+      if (target === commentId) return { ...post.object, id: commentId, inReplyTo: postId, content: '<p>Comment<script>hidden</script></p>' }
+      throw new Error('Unexpected fetch')
+    })
+    deps.fetchRemoteActor = async author => ({ id: author, inbox, publicKeyPem: follower.publicKey })
+    const threadRoute = { method: 'GET', url: timeline + '/thread', path: new URL(timeline + '/thread').pathname,
+      headers, query: { post: postId }, rawBody: Buffer.alloc(0) }
+    expect((await dispatch({ ...threadRoute, headers: {} }, deps)).status).toBe(401)
+    expect((await dispatch({ ...threadRoute, query: { post: 'https://another.example/not-followed' } }, deps)).status).toBe(422)
+    expect(deps.fetchActorJson).not.toHaveBeenCalled()
+    expect(JSON.parse((await dispatch(threadRoute, deps)).body)).toMatchObject({
+      canReply: true, replies: [{ id: commentId, content: '<p>Comment</p>', depth: 0 }],
+    })
+    const requestId = '46a13253-7c58-41be-9f2e-bb3aa900943b'
+    const responseFor = (data: object) => dispatch({ ...threadRoute, method: 'POST',
+      rawBody: Buffer.from(JSON.stringify({ post: postId, requestId, text: 'My reply', ...data })) }, deps)
+    expect((await responseFor({ network: 'Fediverse' })).status).toBe(200)
+    expect((await responseFor({ network: 'Fediverse' })).status).toBe(200)
+    expect((await responseFor({ network: 'Fediverse', text: 'Different reply' })).status).toBe(409)
+    expect(outgoing.size).toBe(1)
+    expect(send).toHaveBeenLastCalledWith(handle, actor, expect.objectContaining({
+      note: expect.objectContaining({ attributedTo: actor, inReplyTo: postId, to: [remote] }),
+    }))
+    const bskyPost = 'at://did:plc:note/app.bsky.feed.post/3test'
+    expect((await responseFor({ network: 'Bluesky', post: bskyPost })).status).toBe(200)
+    expect(sendBluesky).toHaveBeenCalledExactlyOnceWith({ did, origin, token: 'owner', post: bskyPost, requestId, text: 'My reply' })
+
   })
 })
 

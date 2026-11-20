@@ -40,6 +40,8 @@ export interface TimelineActor {
 export interface TimelineItem {
   /** Object id (Create) or the Announce activity id (boost). */
   id: string
+  /** Canonical remote object for a boost, independent of the activity id. */
+  objectId?: string
   actor: TimelineActor
   /** Sanitized HTML. */
   content: string
@@ -63,6 +65,7 @@ export interface InboundRecord {
 }
 
 export interface ApInboundStore {
+  get?(handle: string, key: string): Promise<InboundRecord | undefined>
   /** Conditional create. false when the key already exists (duplicate delivery). */
   putIfAbsent(handle: string, rec: InboundRecord): Promise<boolean>
   /** Owner-conditional edit. false when absent or owned by someone else. */
@@ -339,7 +342,7 @@ export async function ingestAnnounce(activity: any, c: IngestCtx): Promise<Inges
     key,
     owner: c.signerId,
     sortKey: `${shaped.published}#${key.slice(0, 16)}`,
-    item: { id: activity.id, actor: author, ...shaped, boostedBy: actorOf(c.followee!) },
+    item: { id: activity.id, objectId: obj.id, actor: author, ...shaped, boostedBy: actorOf(c.followee!) },
     ttl: Math.floor(now / 1000) + INBOUND_TTL_SECONDS,
   })
   return created ? 'stored' : 'ignored'
