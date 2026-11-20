@@ -26,6 +26,16 @@ export const DEVICES = {
 export type Source = keyof typeof SOURCES;
 export type Device = keyof typeof DEVICES;
 export type InsightDays = 7 | 30 | 90;
+export type TrendKind = "article" | "post";
+export type TrendItem = {
+  rkey: string;
+  title: string;
+  url: string;
+  publishedAt: string;
+  blueskyUrl?: string;
+  values: (number | null)[];
+};
+export type TrendPage = { days: string[]; items: TrendItem[]; next?: string };
 export type InsightSite = { did: string; handle: string; host: string };
 export type InsightArticle = { rkey: string; title: string; url: string; publishedAt: string; blueskyUrl?: string };
 export type ArticleInsights = {
@@ -100,6 +110,9 @@ export function createInsightsClient({ origin, token }: { origin: string; token:
       request<SharingDirections>("/sharing", undefined, { peer, ...directions }),
     articles: (did: string, after?: string) => request<{ articles: InsightArticle[]; next?: string }>(
       "/articles", { did, ...(after ? { after } : {}) },
+    ),
+    trends: (did: string, kind: TrendKind, days: InsightDays, after?: string) => request<TrendPage>(
+      "/articles", { did, trend: kind, days: String(days), ...(after ? { after } : {}) },
     ),
     replyQueue: (did: string, after?: string) => request<ReplyQueuePage>(
       "/replies", { did, ...(after ? { after } : {}) },

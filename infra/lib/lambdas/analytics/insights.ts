@@ -4,7 +4,7 @@ import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { parse, parseFragment, type DefaultTreeAdapterTypes } from "parse5";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
-import { DEVICES, SOURCES, type ArticleDistribution, type ArticleInsights, type ArticleReplies, type InsightArticle, type InsightSite, type ReplyQueuePage } from "../../../insights";
+import { DEVICES, SOURCES, type ArticleDistribution, type ArticleInsights, type ArticleReplies, type InsightArticle, type InsightSite, type ReplyQueuePage, type TrendKind, type TrendPage } from "../../../insights";
 import { resolveApprovedDids } from "../auth/entitlements";
 import { canShare, readSharing, saveSharing, sharingHosts, workspaceHost, workspaceSites } from "../auth/site-sharing";
 import { verifyJwt } from "../auth/lib/jwt";
@@ -13,6 +13,7 @@ import { safeHttpsUrl } from "../ap/sanitize";
 import { canonicalApOrigin, parseCustomHosts } from "../ap/host";
 import { applyReplyAction, blueskyLink, readHandled, readReplyAction, ReplyActionError } from "./reply-actions";
 import { articleFromIndexRow, type IndexItem } from "../pds/longform-index";
+import { trendDays, trendValues } from "./workspace-trends";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const s3 = new S3Client({});
@@ -225,6 +226,60 @@ async function articleIndexPage(pk: string, limit: number, after?: string) {
   }));
 }
 
+const trendPageSize = 12;
+const trendPostCollection = "app.bsky.feed.post";
+
+async function trendSeries(kind: TrendKind, pk: string, days: string[], publishedAt: string) {
+  const { Items } = await ddb.send(new QueryCommand({
+    TableName: analyticsTable,
+    KeyConditionExpression: "pk = :pk AND sk BETWEEN :start AND :end",
+    ExpressionAttributeValues: { ":pk": pk, ":start": days[0], ":end": days[days.length - 1] },
+    ProjectionExpression: "sk, #views, #likes, #reposts, #replies",
+    ExpressionAttributeNames: { "#views": "views", "#likes": "likes", "#reposts": "reposts", "#replies": "replies" },
+  }));
+  return trendValues(kind, days, publishedAt, Items ?? []);
+}
+
+async function postTrends(site: InsightSite, days: string[], after?: string): Promise<TrendPage> {
+  const list = new URL("https://" + site.host + "/xrpc/com.atproto.repo.listRecords");
+  list.search = new URLSearchParams({
+    repo: site.did, collection: trendPostCollection, limit: String(trendPageSize), ...(after ? { cursor: after } : {}),
+  }).toString();
+  const result = await fetch(list, { redirect: "error", signal: AbortSignal.timeout(5000) });
+  if (!result.ok) throw new Error("The site's short posts are unavailable.");
+  const page = await result.json() as { records?: { uri?: string; value?: { text?: string; createdAt?: string } }[]; cursor?: string };
+  if (!Array.isArray(page.records)) throw new Error("Invalid short post response.");
+  const prefix = `at://${site.did}/${trendPostCollection}/`;
+  const items = await Promise.all(page.records.slice(0, trendPageSize).flatMap(record => {
+    const uri = record?.uri;
+    if (typeof uri !== "string" || !uri.startsWith(prefix)) return [];
+    const rkey = uri.slice(prefix.length);
+    if (!recordKey.test(rkey)) return [];
+    const url = blueskyLink(uri);
+    if (!url) return [];
+    const publishedAt = typeof record.value?.createdAt === "string" ? record.value.createdAt : "";
+    const title = typeof record.value?.text === "string" ? record.value.text.trim().slice(0, 160) : "";
+    return [trendSeries("post", `ENGAGE#${uri}`, days, publishedAt)
+      .then(values => ({ rkey, title: title || "Media post", url, publishedAt, values }))];
+  }));
+  return { days, items, ...(typeof page.cursor === "string" && recordKey.test(page.cursor) ? { next: page.cursor } : {}) };
+}
+
+async function workspaceTrends(site: InsightSite, indexPk: string, kind: TrendKind, range: number, after?: string): Promise<TrendPage> {
+  const days = trendDays(range);
+  if (kind === "post") return postTrends(site, days, after);
+  const page = await articleIndexPage(indexPk, trendPageSize, after);
+  const host = site.host.toLowerCase().replace(/^www\./, "");
+  const items = await Promise.all((page.Items ?? []).flatMap(row => {
+    const item = articleFromIndexRow(row);
+    const article = getArticle(item, site);
+    if (!item || !article) return [];
+    return [trendSeries("article", `VIEW#${host}#${item.currentSlug}`, days, article.publishedAt)
+      .then(values => ({ ...article, values }))];
+  }));
+  return { days, items, next: page.LastEvaluatedKey?.sk };
+}
+
 async function replyQueue(site: InsightSite, pk: string, after?: string): Promise<ReplyQueuePage> {
   // Each request reads one bounded page of the site's publication index. It
   // uses the same two live sources and state as an individual conversation.
@@ -366,6 +421,13 @@ export async function handler(event: APIGatewayProxyEventV2) {
     if (path === `${base}/articles` || path === `${base}/replies`) {
       if (params.after !== undefined && !recordKey.test(params.after)) return json(400, { message: "Invalid article cursor." });
       if (path === `${base}/replies`) return json(200, await replyQueue(site, pk, params.after));
+      if (params.trend !== undefined) {
+        const range = params.days ?? "30";
+        if ((params.trend !== "article" && params.trend !== "post") || !["7", "30", "90"].includes(range)) {
+          return json(400, { message: "Choose articles or short posts and a range of 7, 30, or 90 days." });
+        }
+        return json(200, await workspaceTrends(site, pk, params.trend, Number(range), params.after));
+      }
       const result = await articleIndexPage(pk, 30, params.after);
       const articles = (result.Items ?? []).flatMap(row => {
         const article = getArticle(articleFromIndexRow(row), site);

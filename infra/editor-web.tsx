@@ -1,4 +1,4 @@
-export { PublishingCalendar } from "./publishing-calendar-web";
+export { PublishingCalendar, PublishingLibrary } from "./publishing-calendar-web";
 import {
   useCallback, useEffect, useId, useRef, useState, type CSSProperties, type ReactNode,
 } from "react";
@@ -18,6 +18,8 @@ export interface PostEditorProps {
   onPlanLaunch?: (post: NonNullable<EditorDraft["result"]>) => void;
   renderMarkdown?: (source: string) => ReactNode;
   accent?: string;
+  wide?: boolean;
+  onBack?: () => void;
 }
 
 const css = `
@@ -43,6 +45,7 @@ const css = `
 .ss-editor .ss-status{min-height:1.5em}.ss-editor .ss-preview{overflow-wrap:anywhere}.ss-editor .ss-plain{white-space:pre-wrap}
 
 .ss-editor.ss-editor--article{max-width:82rem;container:ss-editor / inline-size}
+.ss-editor.ss-editor--article.ss-editor--wide{max-width:none;padding-inline:clamp(.65rem,1.9vw,1.7rem)}
 .ss-editor .ss-draft-header,.ss-editor .ss-draft-fields{width:100%;max-width:49rem;margin-inline:auto}
 .ss-editor .ss-draft-writing,.ss-editor .ss-draft-details{min-width:0;display:flow-root}
 .ss-editor .ss-draft-fields .ss-preview{display:none}
@@ -61,11 +64,14 @@ const css = `
   .ss-editor--article .ss-preview-toggle{display:none}
   .ss-editor--article .ss-draft-metadata{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:.85rem}
   .ss-editor--article .ss-draft-writing textarea{min-height:19rem}
+  .ss-editor--wide .ss-draft-layout{grid-template-columns:minmax(0,1.06fr) minmax(0,1fr);column-gap:clamp(1rem,1.6vw,2rem)}
+  .ss-editor--wide .ss-draft-writing textarea{min-height:clamp(19rem,44vh,38rem)}
+  .ss-editor--wide .ss-preview-body{max-height:min(75vh,54rem)}
 }
 `;
 
 /** Reusable authoring UI for a web app that already supplies an authenticated editor client. */
-export function PostEditor({ client, identity, initialKind = "post", initialDraftId, onDirtyChange, onPublished, onPlanLaunch, renderMarkdown, accent }: PostEditorProps) {
+export function PostEditor({ client, identity, initialKind = "post", initialDraftId, onDirtyChange, onPublished, onPlanLaunch, renderMarkdown, accent, wide, onBack }: PostEditorProps) {
   const [draft, setDraft] = useState<EditorDraft>();
   const [fields, setFields] = useState<DraftFields>();
   const [tagText, setTagText] = useState("");
@@ -289,10 +295,12 @@ export function PostEditor({ client, identity, initialKind = "post", initialDraf
   const dirty = fields !== draft.fields;
   const label = longform ? "article" : "post";
   return (
-    <section className={longform && !locked ? "ss-editor ss-editor--article" : "ss-editor"} style={style} aria-labelledby="ss-editor-title">
+    <section className={longform && !locked ? `ss-editor ss-editor--article${wide ? " ss-editor--wide" : ""}` : "ss-editor"} style={style} aria-labelledby="ss-editor-title">
       <style>{css}</style>
       <div className="ss-draft-header">
-        <button type="button" disabled={busy} onClick={() => run(async () => { await flush(); open(); })}>Back to posts and drafts</button>
+        <button type="button" disabled={busy} onClick={() => run(async () => { await flush(); if (onBack) onBack(); else open(); })}>
+          {onBack ? "Back to Publishing" : "Back to posts and drafts"}
+        </button>
         <div className="ss-row"><h1 id="ss-editor-title">{draft.sourceRkey ? "Edit" : "Draft"} {label}</h1></div>
         <div className="ss-status" aria-live="polite">
           {draft.state === "publishing" ? "Publishing…" : draft.state === "published" ? "Published"

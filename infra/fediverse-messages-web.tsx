@@ -29,6 +29,17 @@ const css = `
 .ss-fedi .ss-fedi-composer{margin-bottom:.9rem;display:grid;gap:.75rem}
 .ss-fedi .ss-fedi-list{display:grid;gap:.6rem;padding:0;margin:0 0 .75rem;list-style:none}
 .ss-fedi .ss-fedi-list li{display:grid;gap:.5rem}
+.ss-fedi .ss-fedi-split{display:grid;grid-template-columns:minmax(12rem,.9fr) minmax(0,1.9fr);gap:.8rem}
+.ss-fedi .ss-fedi-peers,.ss-fedi .ss-fedi-thread{display:grid;align-content:start;gap:.45rem;min-width:0}
+.ss-fedi .ss-fedi-peers button{width:100%;text-align:left}
+.ss-fedi .ss-fedi-peers button[aria-pressed=true]{border-color:var(--ss-fedi-accent);background:var(--ss-fedi-surface)}
+.ss-fedi .ss-fedi-history{max-height:min(52vh,33rem);overflow:auto;padding:.25rem}
+.ss-fedi .ss-fedi-back{display:none}
+@media(max-width:710px){
+  .ss-fedi .ss-fedi-split{grid-template-columns:minmax(0,1fr)}
+  .ss-fedi .ss-fedi-split[data-open=false] .ss-fedi-thread,.ss-fedi .ss-fedi-split[data-open=true] .ss-fedi-peers{display:none}
+  .ss-fedi .ss-fedi-back{display:inline-block;justify-self:start}
+}
 .ss-fedi .ss-fedi-list time{font-size:.8rem;color:var(--ss-fedi-muted)}
 .ss-fedi .ss-fedi-text{white-space:pre-wrap}
 .ss-fedi .ss-fedi-announcement{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
@@ -55,10 +66,11 @@ const stateLabel = {
   uncertain: "Delivery unconfirmed",
 };
 
-export function FediverseMessages({ client, accent = "#82aaff" }: { client: FediverseMessagesClient; accent?: string }) {
+export function FediverseMessages({ client, accent = "#82aaff", split = false }: { client: FediverseMessagesClient; accent?: string; split?: boolean }) {
   const headingId = useId();
   const lengthId = useId();
   const [messages, setMessages] = useState<FediverseMessage[]>([]);
+  const [peer, setPeer] = useState<string>();
   const [actor, setActor] = useState<string>();
   const [cursor, setCursor] = useState<string>();
   const [loading, setLoading] = useState(true);
@@ -99,6 +111,7 @@ export function FediverseMessages({ client, accent = "#82aaff" }: { client: Fedi
 
   useEffect(() => {
     setMessages([]);
+    setPeer(undefined);
     setActor(undefined);
     setCursor(undefined);
     setPending(false);
@@ -168,6 +181,28 @@ export function FediverseMessages({ client, accent = "#82aaff" }: { client: Fedi
 
   const length = count(text);
   const canSend = !!text.trim() && length <= FEDIVERSE_MESSAGE_LIMIT && (!!reply || !!recipient.trim());
+  const peers = [...new Set(messages.map(message => message.peer))];
+  const activePeer = peer && peers.includes(peer) ? peer : peers[0];
+  const thread = split ? messages.filter(message => message.peer === activePeer).reverse() : messages;
+  const history = <ol className="ss-fedi-list">
+    {thread.map(message => {
+      const date = new Date(message.sentAt);
+      return <li key={message.id}>
+        <div className="ss-fedi-between">
+          <h3>{split ? message.direction === "received" ? message.peer : "You" : `${message.direction === "received" ? "From" : "To"} ${message.peer}`}</h3>
+          {Number.isFinite(date.getTime()) && <time dateTime={message.sentAt}>{dateFormat.format(date)}</time>}
+        </div>
+        <p className="ss-fedi-text">{message.text}</p>
+        <div className="ss-fedi-between">
+          {stateLabel[message.status] && <p className="ss-fedi-meta">{stateLabel[message.status]}</p>}
+          {message.direction === "received" && <button type="button" disabled={pending || compose}
+            aria-label={`Reply to ${message.peer}`} onClick={() => openComposer(message)}>Reply</button>}
+          {message.status === "uncertain" && <button type="button" disabled={pending || loading}
+            onClick={() => void submit({ retry: message.id })}>Retry send</button>}
+        </div>
+      </li>;
+    })}
+  </ol>;
   return (
     <section className="ss-fedi" style={{ "--ss-fedi-accent": accent } as CSSProperties} aria-labelledby={headingId}>
       <style>{css}</style>
@@ -205,25 +240,16 @@ export function FediverseMessages({ client, accent = "#82aaff" }: { client: Fedi
       <div className="ss-fedi-announcement" aria-live="polite">{announcement}</div>
       {loading && <p className="ss-fedi-meta" role="status">Loading messages…</p>}
       {!loading && actor && !messages.length && <p className="ss-fedi-empty">No Fediverse messages yet.</p>}
-      {!!messages.length && <ol className="ss-fedi-list">
-        {messages.map(message => {
-          const date = new Date(message.sentAt);
-          return <li key={message.id}>
-            <div className="ss-fedi-between">
-              <h3>{message.direction === "received" ? "From" : "To"} {message.peer}</h3>
-              {Number.isFinite(date.getTime()) && <time dateTime={message.sentAt}>{dateFormat.format(date)}</time>}
-            </div>
-            <p className="ss-fedi-text">{message.text}</p>
-            <div className="ss-fedi-between">
-              {stateLabel[message.status] && <p className="ss-fedi-meta">{stateLabel[message.status]}</p>}
-              {message.direction === "received" && <button type="button" disabled={pending || compose}
-                aria-label={`Reply to ${message.peer}`} onClick={() => openComposer(message)}>Reply</button>}
-              {message.status === "uncertain" && <button type="button" disabled={pending || loading}
-                onClick={() => void submit({ retry: message.id })}>Retry send</button>}
-            </div>
-          </li>;
-        })}
-      </ol>}
+      {!!messages.length && (split ? <div className="ss-fedi-split" data-open={!!peer && peers.includes(peer)}>
+        <section className="ss-fedi-peers" aria-label="Fediverse conversations"><h3>Conversations</h3>
+          {peers.map(item => <button type="button" key={item} disabled={compose || pending}
+            aria-pressed={activePeer === item} onClick={() => setPeer(item)}>{item}</button>)}
+        </section>
+        <section className="ss-fedi-thread" aria-label="Open Fediverse conversation">
+          <button type="button" className="ss-fedi-back" disabled={compose || pending} onClick={() => setPeer(undefined)}>All conversations</button>
+          <h3>{activePeer}</h3><div className="ss-fedi-history" tabIndex={0}>{history}</div>
+        </section>
+      </div> : history)}
       {cursor && <button type="button" disabled={loading || pending} onClick={() => void refresh(cursor)}>Load older messages</button>}
     </section>
   );

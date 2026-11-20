@@ -1,6 +1,6 @@
 {
   "name": "@martzmakes/serverless-social",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "AWS CDK constructs for an AT Protocol PDS, shared firehose, and static sites",
   "repository": {
     "type": "git",

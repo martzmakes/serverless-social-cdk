@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import type { InsightsClient, SharingDirections, SiteSharing } from "./insights";
 
 const body: CSSProperties = { color: "inherit", font: "14px/1.55 system-ui, sans-serif", overflowWrap: "anywhere" };
@@ -75,4 +75,29 @@ function SharingPeer({ client, peer }: { client: InsightsClient; peer: SiteShari
       {error && <p role="alert">{error}</p>}
     </fieldset>
   );
+}
+/** Present an owner's existing settings as task-focused panels. */
+export function WorkspaceSettings({ appearance, sharing, publishing }: {
+  appearance: ReactNode; sharing: ReactNode; publishing: ReactNode;
+}) {
+  const [task, setTask] = useState<"appearance" | "sharing" | "publishing">("appearance");
+  const tasks = { appearance: "Site appearance", sharing: "Cross-site sharing", publishing: "Publishing" } as const;
+  return <section className="ss-settings-tasks" aria-label="Settings">
+    <style>{`
+      .ss-settings-tasks h1{font-size:clamp(1.8rem,4vw,3rem);margin:.1rem 0 1rem;line-height:1.1;letter-spacing:-.04em}
+      .ss-settings-tasks .ss-task-nav{display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.85rem}
+      .ss-settings-tasks .ss-task-nav button{font:inherit;color:inherit;background:var(--mw-card,#182638);border:1px solid var(--mw-line,#4a607e);border-radius:.45rem;padding:.4rem .65rem;cursor:pointer}
+      .ss-settings-tasks .ss-task-nav button[aria-pressed=true]{border-color:#87afd8;background:#263c59}
+      .ss-settings-tasks .ss-task-panel{min-width:0;max-width:48rem;padding:clamp(.65rem,2.5vw,1.25rem);border-radius:.65rem;border:1px solid var(--mw-line,#4a607e);background:var(--mw-card,#182638)}
+    `}</style>
+    <h1>Settings</h1>
+    <div className="ss-task-nav" role="group" aria-label="Settings task">
+      {(Object.entries(tasks) as [keyof typeof tasks, string][]).map(([key, name]) => (
+        <button type="button" key={key} aria-pressed={task === key} onClick={() => setTask(key)}>{name}</button>
+      ))}
+    </div>
+    <section className="ss-task-panel" aria-label={tasks[task]}>
+      {task === "appearance" ? appearance : task === "sharing" ? sharing : publishing}
+    </section>
+  </section>;
 }

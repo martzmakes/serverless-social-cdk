@@ -1,7 +1,9 @@
 export { ArticleReplyQueue } from "./reply-queue-web";
-export { SiteSharingSettings } from "./site-sharing-web";
+export { InlineArticleReply, useArticleStream } from "./article-stream-web";
+export { SiteSharingSettings, WorkspaceSettings } from "./site-sharing-web";
 import { ReplyItem } from "./article-reply-web";
-import { useEffect, useState, type CSSProperties } from "react";
+import { WorkspaceTrends } from "./trends-web";
+import { useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   DEVICES, SHARE_SOURCES, SOURCES, taggedArticleUrl,
   type ArticleDistribution, type ArticleInsights, type ArticleReplies, type ArticleReply,
@@ -21,8 +23,8 @@ function message(error: unknown) {
   return error instanceof Error ? error.message : "Could not load analytics.";
 }
 
-export function PostInsights({ client, preferredHost, accent = "#4476e7" }: {
-  client: InsightsClient; preferredHost?: string; accent?: string;
+export function PostInsights({ client, preferredHost, accent = "#4476e7", workspace = false, initialArticle }: {
+  client: InsightsClient; preferredHost?: string; accent?: string; workspace?: boolean; initialArticle?: { did: string; rkey: string };
 }) {
   const [sites, setSites] = useState<InsightSite[]>();
   const [did, setDid] = useState("");
@@ -35,14 +37,15 @@ export function PostInsights({ client, preferredHost, accent = "#4476e7" }: {
     void client.sites().then(result => {
       if (!active) return;
       setSites(result.sites);
-      setDid((result.sites.find(site => site.host === preferredHost) ?? result.sites[0])?.did ?? "");
+      setDid((result.sites.find(site => site.did === initialArticle?.did)
+        ?? result.sites.find(site => site.host === preferredHost) ?? result.sites[0])?.did ?? "");
     }).catch(reason => { if (active) setError(message(reason)); });
     return () => { active = false; };
-  }, [client, preferredHost, attempt]);
+  }, [client, preferredHost, attempt, initialArticle?.did]);
   const selectedSite = sites?.find(site => site.did === did);
   return (
-    <section aria-label="Post control room" style={{ maxWidth: 880, margin: "auto", padding: "clamp(1rem, 4vw, 2rem)", fontFamily: "system-ui", overflowWrap: "anywhere" }}>
-      <h1 style={{ marginTop: 0 }}>Post control room</h1>
+    <section aria-label={workspace ? "Analytics" : "Post control room"} style={{ maxWidth: workspace ? "100%" : 880, margin: "auto", padding: workspace ? 0 : "clamp(1rem, 4vw, 2rem)", fontFamily: "system-ui", overflowWrap: "anywhere" }}>
+      <h1 style={{ marginTop: 0 }}>{workspace ? "Analytics" : "Post control room"}</h1>
       {error ? (
         <><p role="alert">{error}</p><button onClick={() => setAttempt(n => n + 1)}>Retry</button></>
       ) : !sites ? <p role="status">Loading sites…</p> : sites.length === 0 ? (
@@ -54,11 +57,57 @@ export function PostInsights({ client, preferredHost, accent = "#4476e7" }: {
               {sites.map(site => <option key={site.did} value={site.did}>{site.host}</option>)}
             </select>
           </label>
-          {selectedSite && <SiteArticles key={did} client={client} site={selectedSite} accent={accent} />}
+          {selectedSite && (workspace ? <WorkspaceInsights key={did} client={client} site={selectedSite} accent={accent}
+              initialRkey={initialArticle?.did === did ? initialArticle.rkey : undefined} />
+            : <SiteArticles key={did} client={client} site={selectedSite} accent={accent} />)}
         </>
       )}
     </section>
   );
+}
+
+function WorkspaceInsights({ client, site, accent, initialRkey }: { client: InsightsClient; site: InsightSite; accent: string; initialRkey?: string }) {
+  const [days, setDays] = useState<InsightDays>(30);
+  const [selected, setSelected] = useState<InsightArticle>();
+  const [detailError, setDetailError] = useState("");
+  const detail = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!initialRkey) return;
+    let active = true;
+    void client.article(site.did, initialRkey, 30).then(report => { if (active) setSelected(report.article); })
+      .catch(reason => { if (active) setDetailError(message(reason)); });
+    return () => { active = false; };
+  }, [client, initialRkey, site.did]);
+  useEffect(() => {
+    if (!selected) return;
+    detail.current?.focus({ preventScroll: true });
+    detail.current?.scrollIntoView({ block: "start" });
+  }, [selected]);
+  return <>
+    <WorkspaceTrends client={client} site={site} days={days} setDays={setDays} onOpenArticle={setSelected} />
+    {detailError && !selected && <p role="alert">{detailError}</p>}
+    {selected && <section ref={detail} tabIndex={-1} aria-label="Article analytics detail">
+      <button type="button" onClick={() => setSelected(undefined)}>Close article report</button>
+      <ArticleDetails key={selected.rkey} article={selected} client={client} site={site} days={days} accent={accent} />
+    </section>}
+  </>;
+}
+
+function ArticleDetails({ article, client, site, days, accent }: {
+  article: InsightArticle; client: InsightsClient; site: InsightSite; days: InsightDays; accent: string;
+}) {
+  return <>
+    <div style={{ marginBlock: "1.5rem" }}>
+      <h2 style={{ marginBottom: ".5rem" }}>{article.title}</h2>
+      <div style={layout}>
+        <a href={article.url}>Open article</a>
+        {article.blueskyUrl && <a href={article.blueskyUrl}>Open Bluesky post</a>}
+      </div>
+    </div>
+    <ArticleConversation client={client} site={site} rkey={article.rkey} />
+    <Distribution client={client} did={site.did} article={article} />
+    <Report key={days} client={client} did={site.did} rkey={article.rkey} days={days} accent={accent} />
+  </>;
 }
 
 function SiteArticles({ client, site, accent }: { client: InsightsClient; site: InsightSite; accent: string }) {
@@ -105,20 +154,7 @@ function SiteArticles({ client, site, accent }: { client: InsightsClient; site: 
       {error && <p role="alert">{error} <button onClick={() => setAttempt(n => n + 1)}>Retry</button></p>}
       {next && !error && <p><button disabled={loading} onClick={() => setAfter(next)}>Load more articles</button></p>}
       {!rkey && !next && !loading && !error && <p>Publish an article to start seeing its analytics here.</p>}
-      {selectedArticle && (
-        <div key={rkey}>
-          <div style={{ marginBlock: "1.5rem" }}>
-            <h2 style={{ marginBottom: ".5rem" }}>{selectedArticle.title}</h2>
-            <div style={layout}>
-              <a href={selectedArticle.url}>Open article</a>
-              {selectedArticle.blueskyUrl && <a href={selectedArticle.blueskyUrl}>Open Bluesky post</a>}
-            </div>
-          </div>
-          <ArticleConversation client={client} site={site} rkey={rkey} />
-          <Distribution client={client} did={did} article={selectedArticle} />
-          <Report key={days} client={client} did={did} rkey={rkey} days={days} accent={accent} />
-        </div>
-      )}
+      {selectedArticle && <ArticleDetails key={rkey} article={selectedArticle} client={client} site={site} days={days} accent={accent} />}
     </>
   );
 }

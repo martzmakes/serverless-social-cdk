@@ -57,7 +57,7 @@ export function ReplyItem({ reply, site, client, rkey, composing, onCompose, onH
   return (
     <li className={context ? "ss-reply-card" : undefined} style={context ? undefined : { marginBlock: "1rem" }}>
       {context}
-      <strong>{reply.author}</strong> · <span>{context && reply.network === "Fediverse" ? "Mastodon" : reply.network}</span>
+      <strong>{reply.author}</strong> · <span>{reply.network}</span>
       <p style={{ whiteSpace: "pre-wrap", marginBlock: ".35rem" }}>{reply.text}</p>
       <div style={layout}>
         <a href={reply.url}>Open reply on {reply.network}</a>

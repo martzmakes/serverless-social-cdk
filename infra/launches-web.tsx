@@ -12,6 +12,7 @@ const stateNames = {
 };
 const css = `
 .ss-launches{box-sizing:border-box;max-width:56rem;margin:auto;padding:clamp(1rem,4vw,2rem);font:inherit;overflow-wrap:anywhere}
+.ss-launches.ss-launches--workspace{max-width:none;padding:0;margin:0}
 .ss-launches h1{margin-top:0;line-height:1.14}
 .ss-launches h2,.ss-launches h3,.ss-launches p{margin:0}
 .ss-launches h2{font-size:1.32rem;line-height:1.22}
@@ -41,7 +42,7 @@ const css = `
 
 const reason = (error: unknown) => error instanceof Error ? error.message : "Could not load launches. Try again.";
 
-export function ArticleLaunches({ client, insights, preferredHost, initialArticle, repliesHref, insightsHref, accent = "#79a9ff" }: {
+export function ArticleLaunches({ client, insights, preferredHost, initialArticle, repliesHref, insightsHref, accent = "#79a9ff", workspace = false }: {
   client: LaunchesClient;
   insights: InsightsClient;
   preferredHost?: string;
@@ -49,6 +50,7 @@ export function ArticleLaunches({ client, insights, preferredHost, initialArticl
   repliesHref?: string;
   insightsHref?: string;
   accent?: string;
+  workspace?: boolean;
 }) {
   const [sites, setSites] = useState<InsightSite[]>();
   const [did, setDid] = useState("");
@@ -68,10 +70,10 @@ export function ArticleLaunches({ client, insights, preferredHost, initialArticl
     return () => { active = false; };
   }, [insights, preferredHost, requestedDid, reload]);
 
-  return <section className="ss-launches launch-stack" aria-label="Article launches" style={{ "--ss-launch-link": accent } as CSSProperties}>
+  return <section className={`ss-launches launch-stack${workspace ? " ss-launches--workspace" : ""}`} aria-label="Article launches" style={{ "--ss-launch-link": accent } as CSSProperties}>
     <style>{css}</style>
     <header>
-      <h1>Article launches</h1>
+      <h1>{workspace ? "Launches" : "Article launches"}</h1>
       <p>Write announcements, schedule delivery, and see what happened on each network.</p>
     </header>
     {error ? <p role="alert">{error} <button onClick={() => setReload(value => value + 1)}>Retry</button></p>
