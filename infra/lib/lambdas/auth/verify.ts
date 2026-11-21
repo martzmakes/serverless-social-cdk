@@ -37,6 +37,8 @@ export interface AuthRequestRow {
   clientId: string;
   scope: string;
   createdAt?: number;
+  /** Canonical MCP audience, present only for MCP authorizations. */
+  resource?: string;
   /** Present on AT-Proto rows; must survive approval so the token endpoint sees it. */
   did?: string;
   [key: string]: unknown;
@@ -225,18 +227,30 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
       new GetCommand({
         TableName: OAUTH_TABLE,
         Key: { pk: `AUTH#${oauthCode}`, sk: "AUTH" },
+        ConsistentRead: true,
       })
     );
     const authRequest = authRow.Item as AuthRequestRow | undefined;
     if (authRequest && authRequest.expiresAt >= Date.now()) {
-      await ddb.send(
-        new PutCommand({
+      const mcp = authRequest.resource === new URL("/mcp", SITE_URL).href;
+      try {
+        await ddb.send(new PutCommand({
           TableName: OAUTH_TABLE,
           Item: mergeApproval(oauthCode, authRequest, email),
-        })
-      );
+          ...(mcp ? {
+            ConditionExpression: "attribute_exists(pk) AND approved = :pending AND expiresAt >= :now",
+            ExpressionAttributeValues: { ":pending": false, ":now": Date.now() },
+          } : {}),
+        }));
+      } catch (error) {
+        if (mcp && (error as Error).name === "ConditionalCheckFailedException") {
+          return errorPage("LINK EXPIRED", "Link expired", "This authorization has already been processed. Start the connection again.");
+        }
+        throw error;
+      }
       const callback = new URL(authRequest.redirectUri);
       callback.searchParams.set("code", oauthCode);
+      if (mcp) callback.searchParams.set("iss", authRequest.resource!);
       if (authRequest.state) callback.searchParams.set("state", authRequest.state);
       const ssoJwt = await mintJwt(email);
       return {

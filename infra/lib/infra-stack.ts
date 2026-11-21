@@ -315,7 +315,8 @@ export class InfraStack extends cdk.Stack {
           apigwv2.CorsHttpMethod.DELETE,
           apigwv2.CorsHttpMethod.OPTIONS,
         ],
-        allowHeaders: ["authorization", "content-type"],
+        allowHeaders: ["authorization", "content-type", "mcp-protocol-version"],
+        exposeHeaders: ["www-authenticate"],
       },
     });
 

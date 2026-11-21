@@ -168,6 +168,19 @@ The report counts page requests classified as human, grouped by day. It estimate
 
 Existing per-site daily totals and referrer domains remain available. Source and device coverage starts when the updated aggregator processes logs. The rollup keeps counters and reduced referrer domains. Original access logs stay in the private bucket and expire after 30 days. The report uses the article's current canonical slug. It shows the latest saved Bluesky engagement snapshot when available, the Fediverse article object, and the Open Graph metadata from the published page. Open Article replies to read the Bluesky conversation alongside public and unlisted direct replies received over ActivityPub. Fediverse reply collection starts when the updated inbox handler is deployed and retains each reply for 90 days. The inbox lets an author send a reply from the selected publishing identity and mark a reply handled or reopen it. The handled state is private and shared across sites for that identity and article. Bluesky sends an AT Protocol reply with the original thread root and parent. Fediverse sends a signed ActivityPub reply to the commenter's instance, and transient failures use the existing delivery queue. A later Fediverse reply to one of the site's replies appears under the same article.
 
+## Connect the MCP server
+
+Use the stack's `McpUrl` output as the Streamable HTTP endpoint. Sign in through the email-link OAuth flow and start with `list_accounts`. Choose the publishing identity explicitly for each tool call.
+
+- `mcp:read` is the default grant for account and analytics tools.
+- Request `mcp:read mcp:tools` to also authorize publishing and record deletion. The OAuth consent screen displays those permissions.
+
+The authorization server advertises S256 PKCE at `/.well-known/oauth-authorization-server/mcp`. The protected resource document is at `/.well-known/oauth-protected-resource/mcp`. These routes belong to MCP. The AT Protocol authorization flow keeps its own discovery endpoints.
+
+MCP access tokens bind the issuer and audience to the canonical MCP URL and expire after one hour. Refresh tokens are bound to the client and resource and rotate on use. Existing connections must authorize again after upgrading from the earlier shared-token implementation. Browser sign-in continues to use its app session.
+
+The server supports the MCP 2025-11-25 Streamable HTTP lifecycle and Dynamic Client Registration. The JSON transport does not need a persistent session. Browser clients with an `Origin` header need the canonical site origin or an exact match in the MCP Lambda's `MCP_ALLOWED_ORIGINS` setting.
+
 ## Add article replies to the signed-in inbox
 
 Import `ArticleReplyQueue` from `@martzmakes/serverless-social/insights-web` and render `<ArticleReplyQueue client={client} />` with the same authenticated insights client. The queue merges replies across approved sites and sorts loaded replies by reply time. Search matches the loaded reply text, author, and article title. The site and network filters apply to both Open and Handled. Undo reverses your last status change.

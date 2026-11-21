@@ -43,6 +43,7 @@ export type RefreshIdentity = {
   email: string;
   clientId: string;
   scope: string;
+  resource: string;
 };
 
 function base64url(buf: Buffer): string {
@@ -116,6 +117,7 @@ export async function issueRefreshToken(
         email: identity.email,
         clientId: identity.clientId,
         scope: identity.scope,
+        resource: identity.resource,
         createdAt: Date.now(),
         ttl: Math.floor(Date.now() / 1000) + REFRESH_TOKEN_TTL_SECONDS,
       },
@@ -124,39 +126,30 @@ export async function issueRefreshToken(
   return token;
 }
 
-export async function deleteRefreshToken(
-  ddb: DocClient,
-  table: string,
-  rawToken: string
-): Promise<void> {
-  await ddb.send(
-    new DeleteCommand({
-      TableName: table,
-      Key: { pk: `REFRESH#${hashToken(rawToken)}`, sk: "REFRESH" },
-    })
-  );
-}
-
 // Returns the caller identity plus the successor refresh token the client
 // should persist. Null means the token is unusable (unknown/expired/retired).
 export async function consumeRefreshToken(
   ddb: DocClient,
   table: string,
-  rawToken: string
+  rawToken: string,
+  request: { clientId: string; resource: string; scope?: string; allowedEmails: string[] },
 ): Promise<(RefreshIdentity & { rotatedRefreshToken: string }) | null> {
   const key = { pk: `REFRESH#${hashToken(rawToken)}`, sk: "REFRESH" };
-  const res = await ddb.send(new GetCommand({ TableName: table, Key: key }));
+  const res = await ddb.send(new GetCommand({ TableName: table, Key: key, ConsistentRead: true }));
   const row = res.Item;
-  if (!row) return null;
+  if (!row || row.clientId !== request.clientId || row.resource !== request.resource ||
+      typeof row.email !== "string" || !request.allowedEmails.includes(row.email) || typeof row.scope !== "string") return null;
+  if (request.scope?.split(" ").some(scope => !String(row.scope).split(" ").includes(scope))) return null;
   const ttl = typeof row.ttl === "number" ? row.ttl : 0;
   if (ttl < Math.floor(Date.now() / 1000)) {
     await ddb.send(new DeleteCommand({ TableName: table, Key: key }));
     return null;
   }
   const identity: RefreshIdentity = {
-    email: String(row.email || ""),
-    clientId: String(row.clientId || ""),
-    scope: String(row.scope || ""),
+    email: row.email,
+    clientId: request.clientId,
+    scope: row.scope,
+    resource: request.resource,
   };
 
   // Already rotated: idempotent inside the grace window (serve the same
@@ -200,7 +193,7 @@ export async function consumeRefreshToken(
     ) {
       // Lost the rotate race — return the winner's successor.
       const re = await ddb.send(
-        new GetCommand({ TableName: table, Key: key })
+        new GetCommand({ TableName: table, Key: key, ConsistentRead: true })
       );
       const winnerEnc = re.Item?.successorEnc;
       const winner =

@@ -1,6 +1,5 @@
 // MCP server Lambda — JSON-RPC 2.0 over HTTP POST (Streamable HTTP transport).
-// Auth: Bearer JWT minted by the magic-link sign-in (or by the OAuth flow for
-// remote MCP clients like Claude Desktop).
+// Auth: OAuth access token scoped to the MCP resource.
 //
 // Spec: https://modelcontextprotocol.io/specification
 //
@@ -20,8 +19,7 @@ import {
   GetCommand,
   DynamoDBDocumentClient,
 } from "@aws-sdk/lib-dynamodb";
-import { randomUUID } from "crypto";
-import { verifyJwt } from "../auth/lib/jwt";
+import { READ_SCOPE, WRITE_SCOPE, mcpResource, verifyMcpToken } from "./auth";
 import {
   listResources,
   readResource,
@@ -55,24 +53,15 @@ const DOMAIN = process.env.DOMAIN!;
 const MCP_PUBLIC_BASE = process.env.MCP_PUBLIC_BASE || `https://${DOMAIN}`;
 
 const PROTOCOL_VERSION = "2025-11-25";
+const SUPPORTED_VERSIONS = new Set([PROTOCOL_VERSION, "2025-06-18"]);
+const RESOURCE = mcpResource(MCP_PUBLIC_BASE);
+const RESOURCE_METADATA = new URL("/.well-known/oauth-protected-resource/mcp", RESOURCE).href;
+const ALLOWED_ORIGINS = new Set([
+  new URL(RESOURCE).origin,
+  ...(process.env.MCP_ALLOWED_ORIGINS ?? "").split(",").map(value => value.trim()).filter(Boolean),
+]);
 const SERVER_NAME = PROJECT_SLUG;
 const SERVER_VERSION = "0.1.0";
-
-// Sandbox domain Claude uses to iframe widgets — sha256(mcpUrl).slice(0,32)
-// + ".claudemcpcontent.com". Compute with `scripts/mcp-sandbox-domain.sh`
-// after deploy and paste here. Until then, widgets work but Claude shows a
-// "local connector" warning.
-//
-// Claude rejects ui.domain hints from raw *.execute-api.amazonaws.com URLs
-// — the MCP server MUST be served from a verified custom domain (the
-// CloudFront proxy in infra-stack.ts handles this).
-const WIDGET_DOMAIN =
-  process.env.MCP_WIDGET_DOMAIN || "<COMPUTE_AFTER_FIRST_DEPLOY>.claudemcpcontent.com";
-
-const WIDGET_CSP = {
-  connectDomains: [DOMAIN, WIDGET_DOMAIN],
-  resourceDomains: [] as string[],
-};
 
 // Helper to attach widget metadata to a tool definition. The pairing tells
 // Claude to iframe the matching ui:// resource alongside the tool result.
@@ -91,6 +80,8 @@ function widgetUiMeta(resourceUri: string) {
 // ---------------------------------------------------------------------------
 // Tool catalog — Spec #6 domain tools
 // ---------------------------------------------------------------------------
+
+const WRITE_TOOLS = new Set(["create_post", "create_longform", "delete_record"]);
 
 const TOOLS = [
   {
@@ -300,7 +291,17 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
     _meta: widgetUiMeta(`ui://${PROJECT_SLUG}/user-card`),
   },
-] as const;
+].map(tool => ({
+  ...tool,
+  annotations: {
+    readOnlyHint: !WRITE_TOOLS.has(tool.name),
+    ...(WRITE_TOOLS.has(tool.name) ? {
+      destructiveHint: tool.name === "delete_record",
+      idempotentHint: false,
+    } : {}),
+    openWorldHint: WRITE_TOOLS.has(tool.name) || tool.name === "list_post_engagement",
+  },
+}));
 
 // ---------------------------------------------------------------------------
 // Tool handlers
@@ -460,13 +461,13 @@ function rpcErr(
   return { jsonrpc: "2.0", id: id ?? null, error: { code, message, data } };
 }
 
-function corsHeaders(): Record<string, string> {
+function responseHeaders(): Record<string, string> {
   return {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+    "cache-control": "no-store",
+    "access-control-allow-methods": "GET,POST,OPTIONS",
     "access-control-allow-headers":
-      "authorization,content-type,mcp-session-id,mcp-protocol-version",
-    "access-control-expose-headers": "mcp-session-id,www-authenticate",
+      "authorization,content-type,mcp-protocol-version",
+    "access-control-expose-headers": "www-authenticate",
   };
 }
 
@@ -479,7 +480,7 @@ function httpJson(
     statusCode,
     headers: {
       "content-type": "application/json",
-      ...corsHeaders(),
+      ...responseHeaders(),
       ...extraHeaders,
     },
     body: JSON.stringify(body),
@@ -487,7 +488,7 @@ function httpJson(
 }
 
 function httpNoContent(statusCode: number) {
-  return { statusCode, headers: corsHeaders(), body: "" };
+  return { statusCode, headers: responseHeaders(), body: "" };
 }
 
 // ---------------------------------------------------------------------------
@@ -496,18 +497,19 @@ function httpNoContent(statusCode: number) {
 
 async function dispatch(
   email: string,
+  canWrite: boolean,
   req: JsonRpcRequest
 ): Promise<JsonRpcResponse | null> {
-  // Notifications (no response)
-  if (req.id == null && req.method.startsWith("notifications/")) return null;
+  // Notifications are acknowledged by the HTTP handler without side effects.
 
   const id = req.id ?? null;
 
   try {
     switch (req.method) {
-      case "initialize":
+      case "initialize": {
+        const offered = (req.params as { protocolVersion?: string } | undefined)?.protocolVersion;
         return ok(id, {
-          protocolVersion: PROTOCOL_VERSION,
+          protocolVersion: offered && SUPPORTED_VERSIONS.has(offered) ? offered : PROTOCOL_VERSION,
           capabilities: {
             tools: { listChanged: false },
             resources: { listChanged: false },
@@ -521,12 +523,13 @@ async function dispatch(
           },
           serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
         });
+      }
 
       case "ping":
         return ok(id, {});
 
       case "tools/list":
-        return ok(id, { tools: TOOLS });
+        return ok(id, { tools: TOOLS.filter(tool => canWrite || !WRITE_TOOLS.has(tool.name)) });
 
       case "resources/list":
         return ok(id, { resources: listResources() });
@@ -576,18 +579,10 @@ async function dispatch(
 // Entry point
 // ---------------------------------------------------------------------------
 
-async function extractEmail(
-  authHeader: string | undefined
-): Promise<string | null> {
-  if (!authHeader) return null;
-  const match = /^Bearer\s+(.+)$/i.exec(authHeader);
-  if (!match) return null;
-  try {
-    const { email } = await verifyJwt(match[1]);
-    return email;
-  } catch {
-    return null;
-  }
+async function authenticate(authHeader: string | undefined) {
+  const match = /^Bearer (\S+)$/i.exec(authHeader ?? "");
+  if (!match) return;
+  return verifyMcpToken(match[1], RESOURCE).catch(() => undefined);
 }
 
 function serveWidgetHtml(widgetPath: string) {
@@ -596,7 +591,7 @@ function serveWidgetHtml(widgetPath: string) {
   if (!r) {
     return {
       statusCode: 404,
-      headers: { "content-type": "application/json", ...corsHeaders() },
+      headers: { "content-type": "application/json", ...responseHeaders() },
       body: JSON.stringify({ error: "not_found", uri }),
     };
   }
@@ -608,112 +603,80 @@ function serveWidgetHtml(widgetPath: string) {
       // plain text/html so browsers actually render them (nosniff blocks
       // structured-syntax suffixes / unusual MIMEs in strict modes).
       "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-cache, no-store, must-revalidate",
       "x-content-type-options": "nosniff",
       // Host iframes load from a different origin (claudeusercontent.com /
       // web-sandbox.oaiusercontent.com); without CORP=cross-origin some
       // COEP-fronted hosts block the cross-origin fetch.
       "cross-origin-resource-policy": "cross-origin",
-      ...corsHeaders(),
+      ...responseHeaders(),
+      "cache-control": "no-cache, no-store, must-revalidate",
     },
     body: r.content,
   };
 }
 
-export const handler: APIGatewayProxyHandlerV2 = async (event) => {
+export const handler: APIGatewayProxyHandlerV2 = async event => {
   const method = event.requestContext.http.method;
-  const rawPath = event.rawPath || "";
+  const path = event.rawPath || "";
+  const headers = event.headers ?? {};
+  const origin = headers.origin;
 
-  if (method === "OPTIONS") return httpNoContent(204);
-
-  // Public widget HTML — Claude iframes these directly. No auth required
-  // (the HTML is public; data calls back to /mcp still need Bearer).
-  if (method === "GET" && rawPath.startsWith("/mcp/ui/")) {
-    return serveWidgetHtml(rawPath.slice("/mcp/ui/".length));
+  // Public widget HTML carries no account data.
+  if (method === "GET" && path.startsWith("/mcp/ui/")) {
+    return serveWidgetHtml(path.slice("/mcp/ui/".length));
   }
 
-  // Some clients open SSE on GET /mcp; we don't push, so 405.
-  if (method === "GET") {
-    return httpJson(405, {
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Streaming GET not supported" },
-    });
+  if (origin && !ALLOWED_ORIGINS.has(origin)) {
+    return httpJson(403, rpcErr(null, -32001, "Origin not allowed"));
   }
+  const browserHeaders: Record<string, string> = origin
+    ? { "access-control-allow-origin": origin, vary: "Origin" } : {};
+  const reply = (status: number, body: unknown, extra: Record<string, string> = {}) =>
+    httpJson(status, body, { ...browserHeaders, ...extra });
 
-  // DELETE /mcp would close a session — we're stateless.
-  if (method === "DELETE") return httpNoContent(204);
-
+  if (method === "OPTIONS") {
+    return { ...httpNoContent(204), headers: { ...responseHeaders(), ...browserHeaders } };
+  }
   if (method !== "POST") {
-    return httpJson(405, {
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Method not allowed" },
+    return reply(405, rpcErr(null, -32000, "Method not allowed"), { allow: "POST, OPTIONS" });
+  }
+  const auth = await authenticate(headers.authorization);
+  const challenge = `Bearer resource_metadata="${RESOURCE_METADATA}"`;
+  if (!auth) {
+    return reply(401, rpcErr(null, -32001, "An MCP access token is required"), {
+      "www-authenticate": `${challenge}, scope="${READ_SCOPE}"`,
     });
   }
 
-  const authHeader =
-    event.headers?.authorization || event.headers?.Authorization;
-  const email = await extractEmail(authHeader);
-  if (!email) {
-    // RFC 9728: point clients at the MCP-SCOPED protected-resource metadata so
-    // they can initiate the OAuth flow. The canonical /.well-known/oauth-
-    // protected-resource is owned by the AT-Proto OAuth server (PAR + DPoP
-    // mandatory) — pointing MCP clients there shunted Claude Code/Desktop into
-    // "PAR required". The /mcp-scoped PRM advertises the magic-link MCP AS.
-    const wwwAuth = `Bearer resource_metadata="${MCP_PUBLIC_BASE}/.well-known/oauth-protected-resource/mcp"`;
-    return httpJson(
-      401,
-      {
-        jsonrpc: "2.0",
-        error: {
-          code: -32001,
-          message: "Unauthorized — missing or invalid JWT",
-        },
-      },
-      { "www-authenticate": wwwAuth }
-    );
+  const version = headers["mcp-protocol-version"];
+  if (version && !SUPPORTED_VERSIONS.has(version)) {
+    return reply(400, rpcErr(null, -32600, "Unsupported MCP protocol version"));
   }
-
-  let parsed: JsonRpcRequest | JsonRpcRequest[];
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(event.body || "null");
+    parsed = JSON.parse(event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString("utf8") : event.body ?? "");
   } catch {
-    return httpJson(400, {
-      jsonrpc: "2.0",
-      error: { code: -32700, message: "Parse error" },
+    return reply(400, rpcErr(null, -32700, "Parse error"));
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return reply(400, rpcErr(null, -32600, "Expected one JSON-RPC request"));
+  }
+  const req = parsed as JsonRpcRequest;
+  if (req.jsonrpc !== "2.0" || typeof req.method !== "string" ||
+      (req.id !== undefined && typeof req.id !== "string" && typeof req.id !== "number")) {
+    return reply(400, rpcErr(null, -32600, "Invalid JSON-RPC request"));
+  }
+  if (req.id === undefined) {
+    return { ...httpNoContent(202), headers: { ...responseHeaders(), ...browserHeaders } };
+  }
+
+  const canWrite = auth.scopes.includes(WRITE_SCOPE);
+  const tool = (req.params as { name?: string } | undefined)?.name;
+  if (!canWrite && req.method === "tools/call" && tool && WRITE_TOOLS.has(tool)) {
+    return reply(403, rpcErr(req.id, -32001, "Publishing access requires approval"), {
+      "www-authenticate": `${challenge}, error="insufficient_scope", scope="${READ_SCOPE} ${WRITE_SCOPE}"`,
     });
   }
-
-  // Streamable HTTP: server mints session id on initialize; clients echo it
-  // on subsequent calls. We're stateless, so just generate a fresh one.
-  const incomingSession =
-    event.headers?.["mcp-session-id"] || event.headers?.["Mcp-Session-Id"];
-  const isInitialize =
-    !Array.isArray(parsed) && parsed?.method === "initialize";
-  const sessionId = isInitialize
-    ? randomUUID()
-    : incomingSession || randomUUID();
-  const sessionHeader = { "mcp-session-id": sessionId };
-
-  if (Array.isArray(parsed)) {
-    const results = await Promise.all(parsed.map((r) => dispatch(email, r)));
-    const filtered = results.filter((r): r is JsonRpcResponse => r !== null);
-    if (filtered.length === 0) {
-      return {
-        statusCode: 202,
-        headers: { ...corsHeaders(), ...sessionHeader },
-        body: "",
-      };
-    }
-    return httpJson(200, filtered, sessionHeader);
-  }
-
-  const result = await dispatch(email, parsed);
-  if (result === null) {
-    return {
-      statusCode: 202,
-      headers: { ...corsHeaders(), ...sessionHeader },
-      body: "",
-    };
-  }
-  return httpJson(200, result, sessionHeader);
+  const result = await dispatch(auth.email, canWrite, req);
+  return reply(200, result);
 };

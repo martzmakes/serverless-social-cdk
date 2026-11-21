@@ -19,10 +19,8 @@
 // Spec: https://modelcontextprotocol.io/specification (MCP Apps extension)
 
 const PROJECT_SLUG = process.env.PROJECT_SLUG!;
-const DOMAIN = process.env.DOMAIN!;
-const WIDGET_DOMAIN =
-  process.env.MCP_WIDGET_DOMAIN ||
-  "<COMPUTE_AFTER_FIRST_DEPLOY>.claudemcpcontent.com";
+const WIDGET_DOMAIN = process.env.MCP_WIDGET_DOMAIN;
+
 
 export interface UIResource {
   uri: string;
@@ -32,7 +30,7 @@ export interface UIResource {
   content: string;
   meta: {
     ui: {
-      domain: string;
+      domain?: string;
       permissions: Record<string, unknown>;
       csp: { connectDomains: string[]; resourceDomains: string[] };
     };
@@ -41,10 +39,10 @@ export interface UIResource {
 
 const DEFAULT_META: UIResource["meta"] = {
   ui: {
-    domain: WIDGET_DOMAIN,
+    ...(WIDGET_DOMAIN ? { domain: WIDGET_DOMAIN } : {}),
     permissions: {},
     csp: {
-      connectDomains: [DOMAIN, WIDGET_DOMAIN],
+      connectDomains: [],
       resourceDomains: [],
     },
   },

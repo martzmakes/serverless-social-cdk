@@ -33,9 +33,12 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "crypto";
 import {
   issueRefreshToken,
   consumeRefreshToken,
-  deleteRefreshToken,
 } from "./refresh-tokens";
-import { mintJwt, verifyJwt } from "../auth/lib/jwt";
+import { verifyJwt } from "../auth/lib/jwt";
+import {
+  ACCESS_TOKEN_TTL_SECONDS, MCP_SCOPES, WRITE_SCOPE, mcpResource,
+  mintMcpToken, normalizeMcpScope, oauthResourceMatches,
+} from "../mcp/auth";
 import { sendMagicLinkEmail } from "../auth/lib/email";
 import QRCode from "qrcode";
 
@@ -56,14 +59,6 @@ const SSO_COOKIE_NAME = `${PROJECT_SLUG}_sso`;
 const AUTH_CODE_TTL_SECONDS = 15 * 60;
 const CLIENT_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const MAGIC_LINK_TTL_SECONDS = 15 * 60;
-// Refresh tokens are long-lived and ROTATED on every use (OAuth 2.1), so an
-// actively-used connector keeps rolling forward well past this window; the TTL
-// only bounds an idle connector. Without refresh tokens (pre-2026-07-11), the
-// 30-day access token simply expired and Claude's MCP connector surfaced
-// "Connection has expired. You can reconnect to re-authenticate" with no way
-// to silently renew.
-const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // matches JWT TTL (30 days)
-
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 // ---------------------------------------------------------------------------
@@ -85,12 +80,14 @@ interface AuthRequest {
   codeChallengeMethod: string;
   state?: string;
   scope: string;
+  resource: string;
   approved: boolean;
   email?: string;
   // Random secret embedded in the SSO consent form; the POST must echo it.
   // Bound to this auth request (a different authCode has a different token),
   // never sent anywhere a cross-site page can read it.
   consentToken?: string;
+  consentEmail?: string;
   expiresAt: number;
   createdAt: number;
 }
@@ -180,6 +177,9 @@ function parseRedirect(u: string): URL | null {
   try {
     const url = new URL(u);
     if (FORBIDDEN_REDIRECT_SCHEMES.has(url.protocol)) return null;
+    // Registered public MCP callbacks must use HTTPS, except native loopback.
+    if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname))) return null;
+    if (url.username || url.password) return null;
     if (url.hash) return null; // RFC 6749 3.1.2: no fragment
     return url;
   } catch {
@@ -220,6 +220,7 @@ function base64url(buf: Buffer): string {
 }
 
 function validatePkce(verifier: string, challenge: string): boolean {
+  if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) return false;
   const hash = createHash("sha256").update(verifier).digest();
   return base64url(hash) === challenge;
 }
@@ -258,7 +259,7 @@ async function getClient(clientId: string): Promise<RegisteredClient | null> {
   return (res.Item as RegisteredClient) || null;
 }
 
-async function putAuthRequest(a: AuthRequest) {
+async function putAuthRequest(a: AuthRequest, previousConsent?: string) {
   await ddb.send(
     new PutCommand({
       TableName: OAUTH_TABLE,
@@ -268,6 +269,10 @@ async function putAuthRequest(a: AuthRequest) {
         ...a,
         ttl: Math.floor(a.expiresAt / 1000),
       },
+      ...(previousConsent ? {
+        ConditionExpression: "consentToken = :consent AND approved = :pending",
+        ExpressionAttributeValues: { ":consent": previousConsent, ":pending": false },
+      } : {}),
     })
   );
 }
@@ -277,6 +282,7 @@ async function getAuthRequest(authCode: string): Promise<AuthRequest | null> {
     new GetCommand({
       TableName: OAUTH_TABLE,
       Key: { pk: `AUTH#${authCode}`, sk: "AUTH" },
+      ConsistentRead: true,
     })
   );
   return (res.Item as AuthRequest) || null;
@@ -308,18 +314,14 @@ async function deleteAuthRequest(authCode: string) {
 // path-aware discovery and land on THIS magic-link AS instead of the PAR-only
 // AT-Proto one. (Pre-fix, the MCP pointed clients at the AT-Proto PRM → "PAR
 // required".)
-function mcpIssuer(baseUrl: string): string {
-  return `${baseUrl}/mcp`;
-}
-
 // RFC 9728 Protected Resource Metadata for the MCP resource. `authorization_servers`
 // is the ISSUER identifier (not a metadata URL) so the client performs RFC 8414
 // discovery against `${baseUrl}/mcp` → /.well-known/oauth-authorization-server/mcp.
 function protectedResourceMetadata(baseUrl: string) {
   return {
-    resource: mcpIssuer(baseUrl),
-    authorization_servers: [mcpIssuer(baseUrl)],
-    scopes_supported: ["mcp:read", "mcp:tools"],
+    resource: mcpResource(baseUrl),
+    authorization_servers: [mcpResource(baseUrl)],
+    scopes_supported: MCP_SCOPES,
     bearer_methods_supported: ["header"],
   };
 }
@@ -327,14 +329,15 @@ function protectedResourceMetadata(baseUrl: string) {
 function authorizationServerMetadata(baseUrl: string) {
   return {
     // MUST equal the discovery issuer the client used to build the well-known URL.
-    issuer: mcpIssuer(baseUrl),
+    issuer: mcpResource(baseUrl),
     authorization_endpoint: `${baseUrl}/oauth/authorize`,
     token_endpoint: `${baseUrl}/oauth/token`,
     registration_endpoint: `${baseUrl}/oauth/register`,
     response_types_supported: ["code"],
+    authorization_response_iss_parameter_supported: true,
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
-    scopes_supported: ["mcp:read", "mcp:tools"],
+    scopes_supported: MCP_SCOPES,
     token_endpoint_auth_methods_supported: ["none"],
     service_documentation: `${baseUrl}/`,
   };
@@ -345,27 +348,32 @@ function authorizationServerMetadata(baseUrl: string) {
 // ---------------------------------------------------------------------------
 
 async function handleRegister(raw: string) {
+  if (Buffer.byteLength(raw) > 8192) return errorJson("invalid_request", "Registration is too large");
   let body: Record<string, unknown>;
   try {
-    body = JSON.parse(raw || "{}");
+    const parsed: unknown = JSON.parse(raw || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return errorJson("invalid_request", "Expected a registration object");
+    }
+    body = parsed as Record<string, unknown>;
   } catch {
     return errorJson("invalid_request", "Invalid JSON body");
   }
   const redirectUris = Array.isArray(body.redirect_uris)
     ? (body.redirect_uris as string[])
     : [];
-  if (redirectUris.length === 0) {
-    return errorJson("invalid_redirect_uri", "At least one redirect_uri is required");
+  if (redirectUris.length === 0 || redirectUris.length > 10) {
+    return errorJson("invalid_redirect_uri", "Provide 1 to 10 redirect URIs");
   }
   if (
-    !redirectUris.every((u) => typeof u === "string" && parseRedirect(u) !== null)
+    !redirectUris.every((u) => typeof u === "string" && u.length <= 2048 && parseRedirect(u) !== null)
   ) {
     return errorJson("invalid_redirect_uri", "redirect_uris must be valid absolute URIs");
   }
   const clientId = randomUUID();
   const clientName =
     typeof body.client_name === "string" && body.client_name
-      ? body.client_name
+      ? body.client_name.slice(0, 120)
       : `Client ${clientId.slice(0, 8)}`;
   const client: RegisteredClient = {
     clientId,
@@ -406,16 +414,22 @@ async function handleAuthorize(
     code_challenge_method,
     state,
     scope,
+    resource,
   } = params;
 
   if (!client_id) return errorJson("invalid_request", "client_id is required");
   if (!redirect_uri) return errorJson("invalid_request", "redirect_uri is required");
   if (response_type !== "code")
     return errorJson("unsupported_response_type", "Only code is supported");
-  if (!code_challenge)
-    return errorJson("invalid_request", "code_challenge is required");
+  if (!code_challenge || !/^[A-Za-z0-9_-]{43}$/.test(code_challenge))
+    return errorJson("invalid_request", "An S256 code challenge is required");
   if (code_challenge_method !== "S256")
     return errorJson("invalid_request", "Only S256 is supported");
+
+  const audience = mcpResource(baseUrl);
+  if (!oauthResourceMatches(resource, audience)) return errorJson("invalid_target", "Unknown MCP resource");
+  const grantedScope = normalizeMcpScope(scope);
+  if (!grantedScope) return errorJson("invalid_scope", "Request supported MCP scopes");
 
   // Validate BEFORE persisting anything or redirecting anywhere: an
   // unknown client or unregistered redirect_uri must never reach a
@@ -435,7 +449,8 @@ async function handleAuthorize(
     codeChallenge: code_challenge,
     codeChallengeMethod: code_challenge_method,
     state,
-    scope: scope || "mcp:read mcp:tools",
+    scope: grantedScope,
+    resource: audience,
     approved: false,
     expiresAt: Date.now() + AUTH_CODE_TTL_SECONDS * 1000,
     createdAt: Date.now(),
@@ -449,9 +464,9 @@ async function handleAuthorize(
   if (ssoJwt) {
     try {
       const { email } = await verifyJwt(ssoJwt);
-      if (email) {
+      if (ALLOWED_EMAILS.includes(email)) {
         const consentToken = base64url(randomBytes(32));
-        await putAuthRequest({ ...authRequest, consentToken });
+        await putAuthRequest({ ...authRequest, consentToken, consentEmail: email });
         return html(
           200,
           renderConsentPage({
@@ -460,6 +475,7 @@ async function handleAuthorize(
             authCode,
             consentToken,
             email,
+            scope: grantedScope,
           })
         );
       }
@@ -468,15 +484,23 @@ async function handleAuthorize(
     }
   }
 
-  const handoffUrl = `${baseUrl}/oauth/authorize?oauthCode=${authCode}&handoff=1`;
+  const handoff = new URL("/oauth/authorize", baseUrl);
+  // A second browser starts the same authorization with the original PKCE
+  // parameters, before the user's approval in that browser.
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined) handoff.searchParams.set(key, value);
+  });
+  const handoffUrl = handoff.href;
   let qrDataUrl = "";
   try {
-    qrDataUrl = await QRCode.toDataURL(handoffUrl, { width: 220, margin: 1 });
+    if (!LOOPBACK_HOSTS.has(new URL(redirect_uri).hostname)) {
+      qrDataUrl = await QRCode.toDataURL(handoffUrl, { width: 220, margin: 1 });
+    }
   } catch {
     qrDataUrl = "";
   }
 
-  return html(200, renderSignInPage({ clientName, authCode, qrDataUrl }));
+  return html(200, renderSignInPage({ clientName, authCode, qrDataUrl, scope: grantedScope }));
 }
 
 function safeEqual(a: string, b: string): boolean {
@@ -516,7 +540,7 @@ async function handleConsent(
       email = undefined;
     }
   }
-  if (!email) return errorJson("access_denied", "sign-in required", 401);
+  if (!email || !ALLOWED_EMAILS.includes(email) || email !== authRequest.consentEmail) return errorJson("access_denied", "Sign in again to review access", 401);
 
   // Re-check the stored redirect against the client's registration.
   const client = await getClient(authRequest.clientId);
@@ -525,6 +549,7 @@ async function handleConsent(
   }
 
   const callback = new URL(authRequest.redirectUri);
+  callback.searchParams.set("iss", authRequest.resource);
   if (form.decision === "deny") {
     await deleteAuthRequest(authCode);
     callback.searchParams.set("error", "access_denied");
@@ -537,8 +562,15 @@ async function handleConsent(
   }
 
   // Single use: drop the token as we approve.
-  const { consentToken: _used, ...rest } = authRequest;
-  await putAuthRequest({ ...rest, approved: true, email });
+  const { consentToken: _used, consentEmail: _identity, ...rest } = authRequest;
+  try {
+    await putAuthRequest({ ...rest, approved: true, email }, presentedToken);
+  } catch (error) {
+    if ((error as Error).name === "ConditionalCheckFailedException") {
+      return errorJson("invalid_grant", "Authorization has already been processed");
+    }
+    throw error;
+  }
   callback.searchParams.set("code", authCode);
   if (authRequest.state) callback.searchParams.set("state", authRequest.state);
   return {
@@ -559,8 +591,8 @@ async function handleEmail(raw: string, baseUrl: string) {
 
   const authRequest = await getAuthRequest(oauthCode);
   if (!authRequest) return errorJson("invalid_grant", "unknown authorization");
-  if (authRequest.expiresAt < Date.now()) {
-    return errorJson("invalid_grant", "authorization expired");
+  if (authRequest.expiresAt < Date.now() || authRequest.approved || authRequest.resource !== mcpResource(baseUrl)) {
+    return errorJson("invalid_grant", "Authorization expired or already used");
   }
 
   // Allowlist gate — same logic as auth/request.ts. Non-allowlisted emails
@@ -644,7 +676,12 @@ async function handleToken(raw: string, contentType: string) {
     body = parseFormBody(raw);
   } else {
     try {
-      body = JSON.parse(raw || "{}") as Record<string, string>;
+      const parsed: unknown = JSON.parse(raw || "{}");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
+          Object.values(parsed).some(value => typeof value !== "string")) {
+        return errorJson("invalid_request", "Expected a token request with string parameters");
+      }
+      body = parsed as Record<string, string>;
     } catch {
       return errorJson("invalid_request", "Invalid request body");
     }
@@ -663,7 +700,9 @@ async function handleToken(raw: string, contentType: string) {
 }
 
 async function handleAuthorizationCodeGrant(body: Record<string, string>) {
-  const { code, code_verifier, client_id } = body;
+  const { code, code_verifier, client_id, redirect_uri, resource } = body;
+  const audience = mcpResource(getBaseUrl());
+  if (!oauthResourceMatches(resource, audience)) return errorJson("invalid_target", "Unknown MCP resource");
   if (!code) return errorJson("invalid_request", "code is required");
   if (!code_verifier) return errorJson("invalid_request", "code_verifier is required");
   // OAuth 2.1: public clients include client_id on token requests. Binding
@@ -677,23 +716,33 @@ async function handleAuthorizationCodeGrant(body: Record<string, string>) {
     await deleteAuthRequest(code);
     return errorJson("invalid_grant", "Authorization code has expired");
   }
-  if (!authRequest.approved || !authRequest.email) {
+  if (!authRequest.approved || !authRequest.email || !ALLOWED_EMAILS.includes(authRequest.email)) {
     return errorJson("authorization_pending", "Authorization is pending");
   }
-  if (authRequest.clientId !== client_id) {
-    return errorJson("invalid_grant", "code was not issued to this client");
+  if (authRequest.resource !== audience || authRequest.clientId !== client_id || authRequest.redirectUri !== redirect_uri) {
+    return errorJson("invalid_grant", "Code grant does not match this request");
   }
   if (!validatePkce(code_verifier, authRequest.codeChallenge)) {
     return errorJson("invalid_grant", "PKCE verification failed");
   }
 
-  await deleteAuthRequest(code); // single-use
+  try {
+    await ddb.send(new DeleteCommand({
+      TableName: OAUTH_TABLE,
+      Key: { pk: `AUTH#${code}`, sk: "AUTH" },
+      ConditionExpression: "approved = :approved AND email = :email AND expiresAt >= :now",
+      ExpressionAttributeValues: { ":approved": true, ":email": authRequest.email, ":now": Date.now() },
+    }));
+  } catch (error) {
+    if ((error as Error).name === "ConditionalCheckFailedException") {
+      return errorJson("invalid_grant", "Invalid or expired authorization code");
+    }
+    throw error;
+  }
 
-  const accessToken = await mintJwt(authRequest.email);
+  const accessToken = await mintMcpToken(authRequest.email, authRequest.scope, audience);
   const refreshToken = await issueRefreshToken(ddb, OAUTH_TABLE, {
-    email: authRequest.email,
-    clientId: authRequest.clientId,
-    scope: authRequest.scope,
+    email: authRequest.email, clientId: client_id, scope: authRequest.scope, resource: audience,
   });
 
   return tokenResponse(accessToken, refreshToken, authRequest.scope);
@@ -703,37 +752,22 @@ async function handleAuthorizationCodeGrant(body: Record<string, string>) {
 // token is invalidated and a brand-new one is returned. This is what lets
 // Claude's MCP connector silently renew instead of expiring.
 async function handleRefreshTokenGrant(body: Record<string, string>) {
-  const { refresh_token, client_id } = body;
-  if (!refresh_token)
-    return errorJson("invalid_request", "refresh_token is required");
-  // Public clients bind the request to their client_id (mirrors the
-  // authorization_code branch).
-  if (!client_id) return errorJson("invalid_request", "client_id is required");
+  const { refresh_token, client_id, resource, scope } = body;
+  const audience = mcpResource(getBaseUrl());
+  if (!oauthResourceMatches(resource, audience)) return errorJson("invalid_target", "Unknown MCP resource");
+  if (!refresh_token || !client_id) return errorJson("invalid_request", "refresh_token and client_id are required");
 
-  // Rotation with a reuse-grace window: the connector fires concurrent /
-  // retried refreshes; every request presenting the same (still-in-grace)
-  // token gets the SAME successor instead of one winner + N stranded losers.
-  const rec = await consumeRefreshToken(ddb, OAUTH_TABLE, refresh_token);
-  if (!rec) {
-    console.log("oauth_refresh_reject", { client_id });
-    return errorJson("invalid_grant", "Invalid or expired refresh token");
-  }
-  if (rec.clientId !== client_id) {
-    // A refresh token presented by a different client is treated as
-    // compromised — revoke it (and its just-minted successor) rather than
-    // honoring it.
-    await deleteRefreshToken(ddb, OAUTH_TABLE, refresh_token);
-    await deleteRefreshToken(ddb, OAUTH_TABLE, rec.rotatedRefreshToken);
-    console.log("oauth_refresh_client_mismatch", { client_id });
-    return errorJson(
-      "invalid_grant",
-      "refresh token was not issued to this client"
-    );
-  }
-  const accessToken = await mintJwt(rec.email);
-  console.log("oauth_refresh_ok", { client_id });
+  const requestedScope = scope === undefined ? undefined : normalizeMcpScope(scope);
+  if (scope !== undefined && !requestedScope) return errorJson("invalid_scope", "Request supported MCP scopes");
 
-  return tokenResponse(accessToken, rec.rotatedRefreshToken, rec.scope);
+  const rec = await consumeRefreshToken(ddb, OAUTH_TABLE, refresh_token, {
+    clientId: client_id, resource: audience, scope: requestedScope, allowedEmails: ALLOWED_EMAILS,
+  });
+  if (!rec) return errorJson("invalid_grant", "Invalid or expired refresh token");
+  const grantedScope = requestedScope ?? rec.scope;
+  const accessToken = await mintMcpToken(rec.email, grantedScope, audience);
+
+  return tokenResponse(accessToken, rec.rotatedRefreshToken, grantedScope);
 }
 
 // ---------------------------------------------------------------------------
@@ -797,10 +831,17 @@ const PAGE_STYLES = `
   .email-pill { color: #3B82FF; font-weight: 600; }
 `;
 
+function describeScope(scope: string) {
+  return scope.split(" ").includes(WRITE_SCOPE)
+    ? "Read account and analytics data, publish posts and articles, and delete published records."
+    : "Read account and analytics data.";
+}
+
 function renderSignInPage(args: {
   clientName: string;
   authCode: string;
   qrDataUrl: string;
+  scope: string;
 }): string {
   const escaped = escapeHtml(args.clientName);
   return `<!doctype html>
@@ -813,12 +854,13 @@ function renderSignInPage(args: {
 <div class="card">
   <div class="eyebrow">CONNECT</div>
   <h1>Authorize access</h1>
-  <p class="sub"><span class="client">${escaped}</span> wants to access your account via MCP.</p>
+  <p class="sub"><span class="client">${escaped}</span> requests permission to:</p>
+  <p class="sub">${describeScope(args.scope)}</p>
   ${
     args.qrDataUrl
       ? `<div class="qr-row">
       <img src="${args.qrDataUrl}" alt="QR code" />
-      <div class="qr-copy">On your phone? Scan to finish sign-in on mobile. This page updates automatically once you approve.</div>
+      <div class="qr-copy">On your phone? Scan to open the sign-in page on your phone.</div>
     </div>`
       : ""
   }
@@ -851,6 +893,7 @@ function renderConsentPage(args: {
   authCode: string;
   consentToken: string;
   email: string;
+  scope: string;
 }): string {
   const name = escapeHtml(args.clientName);
   const dest = escapeHtml(redirectDisplay(args.redirectUri));
@@ -865,6 +908,7 @@ function renderConsentPage(args: {
   <div class="eyebrow">CONNECT</div>
   <h1>Authorize access</h1>
   <p class="sub"><span class="client">${name}</span> wants to access your account via MCP, signed in as <span class="email-pill">${escapeHtml(args.email)}</span>.</p>
+  <p class="sub">${describeScope(args.scope)}</p>
   <div class="qr-row"><div class="qr-copy">After you approve, you will be sent back to<br /><span class="dest">${dest}</span><br />Only continue if you started this connection and recognize that address.</div></div>
   <form method="POST" action="/oauth/consent">
     <input type="hidden" name="auth_code" value="${escapeHtml(args.authCode)}" />
@@ -954,10 +998,10 @@ export const handler: APIGatewayProxyHandlerV2 = async (event) => {
 
     return errorJson("not_found", `Unknown endpoint: ${method} ${path}`, 404);
   } catch (err) {
-    console.error("[oauth] handler error", err);
+    console.error("[oauth] handler error", err instanceof Error ? err.name : "Error");
     return errorJson(
       "server_error",
-      err instanceof Error ? err.message : String(err),
+      "The authorization request could not be completed",
       500
     );
   }
