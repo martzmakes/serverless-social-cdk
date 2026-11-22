@@ -4,7 +4,15 @@ import { type InsightDays, type InsightSite, type InsightsClient, type TrendItem
 const number = new Intl.NumberFormat();
 const date = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
 const colors = ["#8fc9ff", "#9de1bd", "#dabaff"];
-const sortOptions = { total: "Highest total", recent: "Newest first", title: "Title" } as const;
+const sortOptions = {
+  total: { ascending: "Fewest first", descending: "Most first" },
+  publishedAt: { ascending: "Oldest first", descending: "Newest first" },
+  title: { ascending: "Title A–Z", descending: "Title Z–A" },
+} as const;
+type SortColumn = keyof typeof sortOptions;
+type Direction = "ascending" | "descending";
+type Sort = { column: SortColumn; direction: Direction };
+type TrendRow = { item: TrendItem; total?: number; publishedAt: number };
 const batchPages = 5;
 
 const css = `
@@ -30,16 +38,23 @@ const css = `
 .ss-trends table{width:100%;border-collapse:collapse;text-align:left}
 .ss-trends th,.ss-trends td{text-align:left;padding:.55rem .7rem;border-bottom:1px solid var(--mw-line,#425570)}
 .ss-trends th{color:var(--mw-muted,#b6c6da);font-size:.86rem}
+.ss-trends th button.trend-sort-heading{padding:.2rem 0;border:0;background:transparent;text-align:left;font-weight:inherit}
+.ss-trends .trend-sort-heading:hover{text-decoration:underline}
+.ss-trends th[aria-sort] .trend-sort-heading{color:var(--mw-text,#edf4ff)}
+.ss-trends .trend-compact-sort{display:none}
 .ss-trends td{vertical-align:middle;color:inherit;overflow-wrap:anywhere}
 .ss-trends td:first-child{width:40%}.ss-trends td:last-child{width:1%}
 .ss-trends td:last-child button{white-space:nowrap}
 .ss-trends td.trend-spark{min-width:7rem;width:22%}
 .ss-trends .trend-link{padding:0;border:0;background:transparent;text-align:left;text-decoration:underline;color:#bedaff;font-weight:640}
 .ss-trends .trend-mobile-date{display:none}
-@media(max-width:1000px){.ss-trends .trend-date-cell{display:none}.ss-trends .trend-mobile-date{display:block}}
+@media(max-width:1000px){
+  .ss-trends .trend-date-cell{display:none}.ss-trends .trend-mobile-date{display:block}
+  .ss-trends .trend-compact-sort{display:grid}
+}
 @media(max-width:590px){
   .ss-trends table,.ss-trends tbody,.ss-trends tr,.ss-trends td{display:block;width:auto!important}
-  .ss-trends thead{position:absolute;clip-path:inset(100%);width:1px;height:1px;overflow:hidden}
+  .ss-trends thead{display:none}
   .ss-trends tr{padding:.55rem .65rem;border-bottom:1px solid var(--mw-line,#425570)}
   .ss-trends td{padding:.2rem 0;border:0}
   .ss-trends td.trend-spark canvas{width:min(100%,14rem)}
@@ -52,6 +67,20 @@ function metricValue(series: (number | null)[], kind: TrendKind) {
   const observed = series.filter((value): value is number => value !== null);
   if (!observed.length) return undefined;
   return kind === "article" ? observed.reduce((sum, value) => sum + value, 0) : observed.at(-1);
+}
+
+export function sortTrendRows(items: TrendItem[], kind: TrendKind, { column, direction }: Sort): TrendRow[] {
+  const multiplier = direction === "ascending" ? 1 : -1;
+  return items.map(item => ({
+    item, total: metricValue(item.values, kind), publishedAt: Date.parse(item.publishedAt),
+  })).sort((a, b) => {
+    if (column === "title") return multiplier * a.item.title.localeCompare(b.item.title);
+    const left = a[column] ?? NaN;
+    const right = b[column] ?? NaN;
+    if (!Number.isFinite(left)) return Number.isFinite(right) ? 1 : 0;
+    if (!Number.isFinite(right)) return -1;
+    return multiplier * (left - right);
+  });
 }
 
 function formatDay(day: string) {
@@ -128,7 +157,7 @@ export function WorkspaceTrends({ client, site, days, setDays, onOpenArticle }: 
   onOpenArticle: (item?: TrendItem) => void;
 }) {
   const [kind, setKind] = useState<TrendKind>("article");
-  const [sort, setSort] = useState<keyof typeof sortOptions>("total");
+  const [sort, setSort] = useState<Sort>({ column: "total", direction: "descending" });
   const [selected, setSelected] = useState<string[]>([]);
   const [data, setData] = useState<TrendPage>();
   const [more, setMore] = useState<string>();
@@ -163,11 +192,8 @@ export function WorkspaceTrends({ client, site, days, setDays, onOpenArticle }: 
 
   const articles = kind === "article";
   const metric = articles ? "website views" : "Bluesky interactions";
-  const rows = useMemo(() => (data?.items ?? []).map(item => ({ item, total: metricValue(item.values, kind) })).sort((a, b) => {
-    if (sort === "title") return a.item.title.localeCompare(b.item.title);
-    if (sort === "recent") return b.item.publishedAt.localeCompare(a.item.publishedAt);
-    return (b.total ?? -1) - (a.total ?? -1);
-  }), [data, sort, kind]);
+  const metricHeading = articles ? "Views" : "Interactions";
+  const rows = useMemo(() => sortTrendRows(data?.items ?? [], kind, sort), [data, sort, kind]);
   const measured = rows.filter(row => row.total !== undefined);
   const overall = data?.days.map((_, day) => {
     const values = measured.map(({ item }) => item.values[day]).filter((value): value is number => value !== null);
@@ -186,6 +212,18 @@ export function WorkspaceTrends({ client, site, days, setDays, onOpenArticle }: 
     onOpenArticle(undefined);
   }
 
+  function columnHeading(column: SortColumn, title: string, className?: string) {
+    const current = sort.column === column ? sort.direction : undefined;
+    const next = current ? (current === "ascending" ? "descending" : "ascending")
+      : column === "title" ? "ascending" : "descending";
+    return <th scope="col" className={className} aria-sort={current}>
+      <button className="trend-sort-heading" type="button" aria-label={`Sort by ${title.toLowerCase()}, ${next}`}
+        onClick={() => setSort({ column, direction: next })}>
+        {title} <span aria-hidden="true">{current === "ascending" ? "↑" : current === "descending" ? "↓" : "↕"}</span>
+      </button>
+    </th>;
+  }
+
   return <div className="ss-trends">
     <style>{css}</style>
     <div className="trend-actions">
@@ -197,8 +235,19 @@ export function WorkspaceTrends({ client, site, days, setDays, onOpenArticle }: 
         <label>Date range<select value={days} onChange={event => { setMore(undefined); setDays(Number(event.target.value) as InsightDays); }}>
           {[7, 30, 90].map(range => <option key={range} value={range}>Last {range} days</option>)}
         </select></label>
-        <label>Sort by<select value={sort} onChange={event => setSort(event.target.value as keyof typeof sortOptions)}>
-          {Object.entries(sortOptions).map(([key, name]) => <option key={key} value={key}>{name}</option>)}
+        <label className="trend-compact-sort">Sort by
+          <select value={`${sort.column}:${sort.direction}`} onChange={event => {
+            const [column, direction] = event.target.value.split(":") as [SortColumn, Direction];
+            setSort({ column, direction });
+          }}>
+          {(Object.keys(sortOptions) as SortColumn[]).map(column =>
+            <optgroup key={column} label={{ total: metricHeading, publishedAt: "Published", title: "Title" }[column]}>
+              {(["descending", "ascending"] as const).map(direction => (
+                <option key={direction} value={`${column}:${direction}`}>
+                  {column === "total" ? `${metricHeading} · ` : ""}{sortOptions[column][direction]}
+                </option>
+              ))}
+            </optgroup>)}
         </select></label>
       </div>
     </div>
@@ -218,8 +267,8 @@ export function WorkspaceTrends({ client, site, days, setDays, onOpenArticle }: 
         </>}
       </section>
       {rows.length ? <div className="trend-list"><table>
-        <thead><tr><th scope="col">Title</th><th scope="col" className="trend-date-cell">Published</th>
-          <th scope="col">{articles ? "Views" : "Latest snapshot"}</th><th scope="col">{days}-day trend</th><th scope="col">Overall chart</th></tr></thead>
+        <thead><tr>{columnHeading("title", "Title")}{columnHeading("publishedAt", "Published", "trend-date-cell")}
+          {columnHeading("total", metricHeading)}<th scope="col">{days}-day trend</th><th scope="col">Overall chart</th></tr></thead>
         <tbody>{rows.map(({item, total: value}) => {
           const isSelected = selected.includes(item.rkey);
           const day = formatDay(item.publishedAt);
