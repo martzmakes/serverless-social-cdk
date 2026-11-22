@@ -120,6 +120,7 @@ import {
 } from '@aws-sdk/lib-dynamodb'
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3'
 import { parseCloudFrontLog } from './log-parse'
+import { addExpression, rollupEvents } from './rollup'
 
 // 35-day TTL on the marker rows — comfortably outlives the ≤30d log retention
 // so a redelivered in-window object can never sneak past an expired marker.
@@ -149,6 +150,11 @@ type Doc = { send: (cmd: any) => Promise<any> }
  *          Throws (fail-closed) on gunzip/parse/Update failure — NO DONE
  *          marker written + CLAIM rolled back → a retry safely re-processes.
  */
+/** Owner networks to ignore, from ANALYTICS_EXCLUDE_CIDRS (comma-separated). */
+function excludeCidrs(): string[] {
+  return (process.env.ANALYTICS_EXCLUDE_CIDRS ?? '').split(',').map((s) => s.trim()).filter(Boolean)
+}
+
 export async function aggregateLogObject(
   key: string,
   gz: Buffer,
@@ -178,7 +184,7 @@ export async function aggregateLogObject(
     // Step 2 — decompress + PII-stripped parse (parseCloudFrontLog returns
     // ONLY slug / eTLD+1 referrerHost / uaClass; we add nothing back).
     const raw = gunzipSync(gz)
-    const events = parseCloudFrontLog(raw)
+    const events = parseCloudFrontLog(raw, { excludeCidrs: excludeCidrs() })
 
     // utcDay: parseCloudFrontLog does NOT surface the per-row date (by design
     // — surfacing raw row fields risks PII creep), so we bucket by "now" UTC
@@ -215,58 +221,12 @@ export async function aggregateLogObject(
     // count of successfully-processed events so the two Task-2 behavioral
     // tests' INTENT (idempotent no-double-count; mid-throw retry-safe) is
     // unweakened — it is a processed-event count, NOT the human-views metric.
-    let views = 0
-    for (const ev of events) {
-      const utcDay = ev.day ?? nowDay
-      // Per-host partition (Task 17). Legacy rows were VIEW#<slug>; they stay
-      // in the table untouched and are folded in at read time (page-views tool).
-      const pk = 'VIEW#' + ev.host + '#' + ev.slug
-      if (ev.uaClass === 'bot') {
-        // BOT: uaBot ONLY — excluded from views, no referrer row (spec §2.1).
-        await doc.send(
-          new UpdateCommand({
-            TableName: table,
-            Key: { pk, sk: utcDay },
-            UpdateExpression: 'ADD #ub :one',
-            ExpressionAttributeNames: { '#ub': 'uaBot' },
-            ExpressionAttributeValues: { ':one': 1 },
-          }),
-        )
-        views++
-        continue
-      }
-      // HUMAN:
-      // (a) main rollup — views, source, and device (pure top-level ADD).
-      await doc.send(
-        new UpdateCommand({
-          TableName: table,
-          Key: { pk, sk: utcDay },
-          UpdateExpression: 'ADD #v :one, #uh :one, #cv :one, #src :one, #device :one',
-          ExpressionAttributeNames: {
-            '#v': 'views',
-            '#uh': 'uaHuman',
-            '#cv': 'classifiedViews',
-            '#src': 'source_' + ev.source,
-            '#device': 'device_' + ev.device,
-          },
-          ExpressionAttributeValues: { ':one': 1 },
-        }),
-      )
-      // (b) referrer rollup — discrete per-host item (pure top-level ADD).
-      await doc.send(
-        new UpdateCommand({
-          TableName: table,
-          Key: {
-            pk,
-            sk: 'REF#' + utcDay + '#' + ev.referrerHost,
-          },
-          UpdateExpression: 'ADD #c :one',
-          ExpressionAttributeNames: { '#c': 'count' },
-          ExpressionAttributeValues: { ':one': 1 },
-        }),
-      )
-      views++
+    // Requests for the same page/day in this file are summed first, then each
+    // row gets one ADD carrying all of its counters (see rollup.ts).
+    for (const row of rollupEvents(events, nowDay)) {
+      await doc.send(new UpdateCommand({ TableName: table, Key: row.key, ...addExpression(row.counters) }))
     }
+    const views = events.length
 
     // Step 4 — commit the DONE marker LAST, only after every event succeeded.
     // Conditional attribute_not_exists(pk): a concurrent in-flight duplicate

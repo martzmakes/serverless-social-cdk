@@ -107,7 +107,8 @@ describe("CloudFront article attribution", () => {
       ["linkedin", "desktop", "direct", "human"],
       ["instagram", "tablet", "instagram.com", "human"],
       ["internal", "tablet", "example.net", "human"],
-      ["direct", "unknown", "direct", "human"],
+      // Only browsers (Mozilla/ user agents) count as human readers.
+      ["direct", "unknown", "direct", "bot"],
       ["facebook", "unknown", "direct", "bot"],
     ]);
     expect(JSON.stringify(result)).not.toMatch(/private|token|customer|Mozilla|192\.0\.2\.1/);

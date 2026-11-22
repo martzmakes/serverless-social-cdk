@@ -75,6 +75,12 @@ export interface ServerlessSocialStackProps extends cdk.StackProps {
   readonly editor?: boolean;
   /** Expose site-owner Bluesky conversations through the private author API. */
   readonly directMessages?: boolean;
+  /**
+   * Viewer networks (IPv4/IPv6 addresses or CIDRs) left out of page-view
+   * analytics, such as the author's own home network. Compared in the log
+   * aggregator only; addresses are never stored.
+   */
+  readonly analyticsExcludeCidrs?: readonly string[];
 }
 
 export class InfraStack extends cdk.Stack {
@@ -1574,7 +1580,7 @@ export class InfraStack extends cdk.Stack {
     const sharingPath = "/auth/insights/sharing";
     const insightsIntegration = new apigwv2Integrations.HttpLambdaIntegration("PostInsightsIntegration", postInsights);
     for (const path of [
-      "/auth/insights", "/auth/insights/articles", "/auth/insights/articles/{rkey}", "/auth/insights/articles/{rkey}/distribution",
+      "/auth/insights", "/auth/insights/overview", "/auth/insights/articles", "/auth/insights/articles/{rkey}", "/auth/insights/articles/{rkey}/distribution",
       replyPath, "/auth/insights/replies", sharingPath,
     ]) {
       const methods = path === replyPath || path === sharingPath
@@ -1596,6 +1602,8 @@ export class InfraStack extends cdk.Stack {
         environment: {
           ...lambdaDefaults.environment,
           POST_ANALYTICS_TABLE: postAnalytics.table.tableName,
+          ...(props.analyticsExcludeCidrs?.length
+            ? { ANALYTICS_EXCLUDE_CIDRS: props.analyticsExcludeCidrs.join(",") } : {}),
         },
         ...lambdaSource("analytics/aggregate"),
       }

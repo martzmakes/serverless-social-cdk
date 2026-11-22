@@ -3,6 +3,8 @@ export { InlineArticleReply, useArticleStream } from "./article-stream-web";
 export { SiteSharingSettings, WorkspaceSettings } from "./site-sharing-web";
 import { ReplyItem } from "./article-reply-web";
 import { WorkspaceTrends } from "./trends-web";
+import { SiteOverview } from "./overview-web";
+export { SiteOverview } from "./overview-web";
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import {
   DEVICES, SHARE_SOURCES, SOURCES, taggedArticleUrl,
@@ -18,6 +20,14 @@ const grid: CSSProperties = { display: "grid", gap: "1.25rem", gridTemplateColum
 const field: CSSProperties = { display: "grid", gap: ".35rem", minWidth: 0 };
 const control: CSSProperties = { minWidth: 0, maxWidth: "100%", padding: ".45rem", font: "inherit" };
 const border: CSSProperties = { border: "1px solid currentColor", borderRadius: 12, padding: "1rem" };
+
+const regions = (() => {
+  try { return new Intl.DisplayNames(undefined, { type: "region" }); } catch { return undefined; }
+})();
+function regionName(code: string) {
+  if (code === "ZZ") return "Unknown";
+  try { return regions?.of(code) ?? code; } catch { return code; }
+}
 
 function message(error: unknown) {
   return error instanceof Error ? error.message : "Could not load analytics.";
@@ -84,6 +94,7 @@ function WorkspaceInsights({ client, site, accent, initialRkey }: { client: Insi
     detail.current?.scrollIntoView({ block: "start" });
   }, [selected]);
   return <>
+    <SiteOverview client={client} site={site} days={days} setDays={setDays} dark />
     <WorkspaceTrends client={client} site={site} days={days} setDays={setDays} onOpenArticle={setSelected} />
     {detailError && !selected && <p role="alert">{detailError}</p>}
     {selected && <section ref={detail} tabIndex={-1} aria-label="Article analytics detail">
@@ -138,6 +149,9 @@ function SiteArticles({ client, site, accent }: { client: InsightsClient; site: 
 
   return (
     <>
+      <div style={{ marginTop: "1.25rem" }}>
+        <SiteOverview client={client} site={site} days={days} setDays={setDays} />
+      </div>
       <div style={{ ...grid, marginTop: "1rem" }}>
         <label style={field}>Article
           <select style={control} value={rkey} onChange={event => setRkey(event.target.value)} disabled={!articles.length}>
@@ -205,6 +219,8 @@ function Report({ client, did, rkey, days, accent }: {
         <Breakdown title="Sources" rows={breakdown(report.sources, SOURCES)} accent={accent} />
         <Breakdown title="Devices" rows={breakdown(report.devices, DEVICES)} accent={accent} />
         <Breakdown title="Top referrer domains" rows={report.referrers.map(({ host, views }) => ({ label: host === "direct" ? SOURCES.direct : host, views }))} accent={accent} />
+        {report.countries && <Breakdown title="Countries (approximate)" rows={report.countries.slice(0, 10).map(({ code, views }) => ({ label: regionName(code), views }))} accent={accent} />}
+        {report.cities && <Breakdown title="Nearest CloudFront cities" rows={report.cities.map(({ code, city, views }) => ({ label: city ?? code, views }))} accent={accent} />}
       </div>
       <ShareLink url={report.article.url} />
     </>

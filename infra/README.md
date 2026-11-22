@@ -166,6 +166,18 @@ const client = createInsightsClient({
 
 The report counts page requests classified as human, grouped by day. It estimates mobile, tablet, desktop, and unknown device groups from the user agent. An allowlisted `utm_source` tag takes priority over the observed referrer. Share tagged links when an app may omit referrers. Without either signal the source is Direct or unavailable. CloudFront delivers logs asynchronously, so recent totals can change after a delay.
 
+### Site overview and how views are counted
+
+The analytics view opens with a site overview for 7, 30, or 90 days: human page views for articles, the home page, and short-post pages (`/profile/<handle>/post/<rkey>`), each compared with the previous period. It also shows a daily stacked chart with a table view, top articles, short posts with their page views and the Bluesky likes, reposts and replies they gained, sources, top referring sites, approximate countries and cities, devices, and Bluesky follower change. Mount `SiteOverview` from `@martzmakes/serverless-social/insights-web` on its own, or let `PostInsights` render it. MCP clients can read the same data with the `get_site_analytics` tool.
+
+Only browsers count as human. A request counts only if its user agent starts with `Mozilla/` and contains no known crawler, preview, monitoring, or AI-agent token. Scripts such as Node's `fetch` (user agent `node`), `curl`, and share-sheet previewers are counted as automated. The overview reports how many automated requests it left out. Scrapers that copy a full browser user agent can still be counted.
+
+Countries and cities come from the CloudFront edge location that served each request (`x-edge-location`). No IP address is looked up or stored. They show where readers are served from, which is usually but not always their country.
+
+Set `analyticsExcludeCidrs` on the stack to leave your own networks out, such as `["203.0.113.7/32"]`. The aggregator compares viewer addresses with the list and drops matches before counting. It never stores the addresses.
+
+The aggregator sums each log file in memory and writes each page/day row once, instead of once per request. To recount days that are still in the 30-day log bucket after a classification change, sync the bucket's `cf/` prefix to a directory and run `scripts/rebuild-analytics.ts` with `--logs`, `--table`, `--from`, `--to` and `--hosts`, then add `--apply`. It writes a marker, and the overview says that earlier days used the older filter and skips comparisons with them.
+
 Existing per-site daily totals and referrer domains remain available. Source and device coverage starts when the updated aggregator processes logs. The rollup keeps counters and reduced referrer domains. Original access logs stay in the private bucket and expire after 30 days. The report uses the article's current canonical slug. It shows the latest saved Bluesky engagement snapshot when available, the Fediverse article object, and the Open Graph metadata from the published page. Open Article replies to read the Bluesky conversation alongside public and unlisted direct replies received over ActivityPub. Fediverse reply collection starts when the updated inbox handler is deployed and retains each reply for 90 days. The inbox lets an author send a reply from the selected publishing identity and mark a reply handled or reopen it. The handled state is private and shared across sites for that identity and article. Bluesky sends an AT Protocol reply with the original thread root and parent. Fediverse sends a signed ActivityPub reply to the commenter's instance, and transient failures use the existing delivery queue. A later Fediverse reply to one of the site's replies appears under the same article.
 
 ## Connect the MCP server

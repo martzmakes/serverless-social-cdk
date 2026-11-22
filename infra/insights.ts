@@ -46,6 +46,51 @@ export type ArticleInsights = {
   sources: Partial<Record<Source, number>>;
   devices: Partial<Record<Device, number>>;
   referrers: { host: string; views: number }[];
+  /** Views by ISO country of the serving CloudFront edge (`ZZ` = unknown). */
+  countries?: CountryViews[];
+  /** Views by serving CloudFront metro. */
+  cities?: CityViews[];
+};
+
+/** Approximate reader country: the country of the CloudFront edge that served the page. */
+export type CountryViews = { code: string; views: number };
+export type CityViews = { code: string; city?: string; country: string; views: number };
+export type ViewTotals = { articles: number; home: number; posts: number };
+export type OverviewArticle = InsightArticle & { views: number; previous: number };
+export type OverviewPost = {
+  rkey: string;
+  text: string;
+  url: string;
+  publishedAt?: string;
+  /** Page loads of the post on this site. */
+  views: number;
+  /** Latest likes + reposts + replies snapshot, when captured. */
+  engagement?: number;
+  /** Engagement added during the selected window. */
+  engagementGain?: number;
+};
+export type SiteOverview = {
+  days: string[];
+  totals: ViewTotals;
+  previous: ViewTotals;
+  /** Automated requests to the same pages, excluded from every count above. */
+  automated: number;
+  daily: ({ day: string } & ViewTotals)[];
+  articleCount: number;
+  topArticles: OverviewArticle[];
+  topPosts: OverviewPost[];
+  sources: Partial<Record<Source, number>>;
+  devices: Partial<Record<Device, number>>;
+  countries: CountryViews[];
+  cities: CityViews[];
+  referrers: { host: string; views: number }[];
+  /**
+   * First day counted with the current automated-traffic filter. Earlier days
+   * were counted with an older filter and can include scripted requests.
+   */
+  cleanFrom?: string;
+  /** Bluesky follower snapshot for the site's account. */
+  followers?: { count: number; change: number; day: string };
 };
 
 export type ArticleDistribution = {
@@ -105,6 +150,7 @@ export function createInsightsClient({ origin, token }: { origin: string; token:
   }
   return {
     sites: () => request<{ sites: InsightSite[] }>(""),
+    overview: (did: string, days: InsightDays) => request<SiteOverview>("/overview", { did, days: String(days) }),
     sharing: () => request<SiteSharing>("/sharing"),
     updateSharing: (peer: string, directions: SharingDirections) =>
       request<SharingDirections>("/sharing", undefined, { peer, ...directions }),

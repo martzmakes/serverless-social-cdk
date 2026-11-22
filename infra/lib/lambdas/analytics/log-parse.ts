@@ -11,13 +11,21 @@
 //
 // Reserved-path filtering shares the rules used by longform-edge.js.
 
-import { isIP } from 'node:net'
+import { BlockList, isIP } from 'node:net'
 import type { Device, Source } from '../../../insights'
 import { classifyDevice, classifySource, decodeLogField } from './attribution'
+import { edgeLocation } from './edge-locations'
 import { isReserved } from '../pds/longform-routing'
 
+/** `article` = /<slug>, `home` = /, `post` = /profile/<actor>/post/<rkey>. */
+export type PageKind = 'article' | 'home' | 'post'
+
 export type ViewEvent = {
+  kind: PageKind
+  /** Article slug, short-post record key, or '' for the home page. */
   slug: string
+  /** Short posts only: the profile handle or DID in the path, lowercased. */
+  actor?: string
   /** Viewer-facing host (x-host-header, lowercased, `www.` stripped) or 'unknown'. */
   host: string
   /** UTC YYYY-MM-DD from the log row's own `date` field; undefined if absent/malformed. */
@@ -26,7 +34,44 @@ export type ViewEvent = {
   uaClass: 'human' | 'bot'
   source: Source
   device: Device
+  /** ISO 3166-1 alpha-2 country of the serving CloudFront edge; `ZZ` if unknown. */
+  country: string
+  /** Three-letter metro code of the serving CloudFront edge, when logged. */
+  edge?: string
 }
+
+export type ParseOptions = {
+  /**
+   * Viewer addresses (IPv4/IPv6, optional /prefix) whose requests are dropped
+   * before classification, such as the owner's own network. The address is
+   * only compared here and never returned.
+   */
+  excludeCidrs?: readonly string[]
+}
+
+/** Build a matcher for `excludeCidrs`; invalid entries are ignored. */
+export function addressFilter(cidrs: readonly string[] = []): (ip: string | undefined) => boolean {
+  const list = new BlockList()
+  let size = 0
+  for (const entry of cidrs) {
+    const [address, prefix] = entry.trim().split('/')
+    const family = isIP(address)
+    if (!family) continue
+    const type = family === 4 ? 'ipv4' : 'ipv6'
+    const bits = prefix === undefined ? (family === 4 ? 32 : 128) : Number(prefix)
+    if (!Number.isInteger(bits) || bits < 0 || bits > (family === 4 ? 32 : 128)) continue
+    list.addSubnet(address, bits, type)
+    size++
+  }
+  if (!size) return () => false
+  return (ip) => {
+    const family = ip ? isIP(ip) : 0
+    return family !== 0 && list.check(ip!, family === 4 ? 'ipv4' : 'ipv6')
+  }
+}
+
+const RECORD_KEY = /^[A-Za-z0-9._~:-]{1,512}$/
+const ACTOR = /^[a-z0-9.:_-]{1,253}$/
 
 const HOST_RE = /^[a-z0-9.-]+$/
 /** Normalize a Host header value to a bare lowercase host without `www.`. */
@@ -74,7 +119,10 @@ function referrerDomain(host: string | undefined): string {
 
 /**
  * Classify a (possibly URL-encoded) User-Agent. `-`/empty/undefined → 'bot'
- * (no UA == automated). Known crawler/tool tokens → 'bot'; else 'human'.
+ * (no UA == automated). Every browser, including in-app browsers, sends a UA
+ * that starts with `Mozilla/`; anything else (`node`, `curl/…`, share-sheet
+ * previewers such as `ActionExtension/2 CFNetwork/…`) is automated. A Mozilla
+ * UA with a known crawler/tool token is also a bot.
  */
 export function uaClass(raw: string | undefined): 'human' | 'bot' {
   if (raw === undefined || raw === '' || raw === '-') return 'bot'
@@ -82,7 +130,8 @@ export function uaClass(raw: string | undefined): 'human' | 'bot' {
   if (ua.includes('%')) {
     try { ua = decodeURIComponent(ua) } catch { /* keep raw */ }
   }
-  ua = ua.toLowerCase()
+  ua = ua.trim().toLowerCase()
+  if (!ua.startsWith('mozilla/')) return 'bot'
   const BOT_TOKENS = [
     'bot', 'crawl', 'spider', 'slurp', 'bingpreview', 'facebookexternalhit',
     'embedly', 'headless', 'curl', 'wget', 'python-requests', 'go-http',
@@ -96,6 +145,10 @@ export function uaClass(raw: string | undefined): 'human' | 'bot' {
     'got (', 'libwww', 'httpie', 'postman', 'scrapy', 'mechanize', 'jetty',
     'ruby', 'php/', 'guzzle', 'perl', 'feedly', 'feedfetcher', 'newsblur',
     'inoreader', 'miniflux', 'tiny tiny rss', 'whatsapp', 'telegrambot', 'skypeuripreview',
+    'lighthouse', 'pagespeed', 'gtmetrix', 'pingdom', 'uptime', 'statuscake', 'preview',
+    'discordbot', 'slackbot', 'linkedinbot', 'twitterbot', 'applebot', 'chatgpt', 'gptbot',
+    'claudebot', 'claude-user', 'perplexity', 'bytespider', 'amazonbot', 'meta-externalagent',
+    'phantomjs', 'puppeteer', 'playwright', 'selenium',
     // NOT 'telegram': the Telegram in-app browser sends `... Telegram-Android/x`
     // for a real reader; the link-preview fetcher is `TelegramBot (like TwitterBot)`.
   ]
@@ -116,13 +169,28 @@ function isAssetOrReserved(slug: string): boolean {
   return false
 }
 
+/** Map a decoded request path to the page it views, or undefined to skip it. */
+export function pageOf(path: string): Pick<ViewEvent, 'kind' | 'slug' | 'actor'> | undefined {
+  const trimmed = path.replace(/^\/+/, '').replace(/\/+$/, '')
+  if (!trimmed) return { kind: 'home', slug: '' }
+  const parts = trimmed.split('/')
+  if (parts.length === 1) return isAssetOrReserved(trimmed) ? undefined : { kind: 'article', slug: trimmed }
+  if (parts.length === 4 && parts[0] === 'profile' && parts[2] === 'post') {
+    const actor = parts[1].toLowerCase()
+    if (ACTOR.test(actor) && RECORD_KEY.test(parts[3])) return { kind: 'post', slug: parts[3], actor }
+  }
+  return undefined
+}
+
 /**
- * Parse a CloudFront standard access-log buffer into longform ViewEvents.
+ * Parse a CloudFront standard access-log buffer into page ViewEvents.
  * Header-driven (reads fields by name); skips comments, blank lines, and any
  * malformed/short/erroring row without throwing. Only 200 GET text/html views
- * of a real top-level longform <slug> survive.
+ * of the home page, a top-level <slug>, or a short-post page survive. Whether
+ * a slug is a real article is checked when the rollups are read.
  */
-export function parseCloudFrontLog(buf: Buffer): ViewEvent[] {
+export function parseCloudFrontLog(buf: Buffer, options: ParseOptions = {}): ViewEvent[] {
+  const excluded = addressFilter(options.excludeCidrs)
   const out: ViewEvent[] = []
   const lines = buf.toString('utf8').split('\n')
   let fieldIndex: Map<string, number> | null = null
@@ -156,24 +224,26 @@ export function parseCloudFrontLog(buf: Buffer): ViewEvent[] {
 
       const rawUri = get('cs-uri-stem')
       if (!rawUri) continue
-      let slug = decodeURIComponent(rawUri)
-      slug = slug.replace(/^\/+/, '').replace(/\/+$/, '')
-      if (!slug || slug.includes('/')) continue
-      if (isAssetOrReserved(slug)) continue
+      const page = pageOf(decodeURIComponent(rawUri))
+      if (!page) continue
+      if (excluded(get('c-ip'))) continue
 
       const rawDay = get('date')
       const host = normHost(get('x-host-header')) ?? normHost(get('cs(Host)')) ?? 'unknown'
       const referrer = referrerHostname(get('cs(Referer)'))
       const domain = referrerDomain(referrer)
       const agent = get('cs(User-Agent)')
+      const location = edgeLocation(get('x-edge-location'))
       out.push({
-        slug,
+        ...page,
         host,
         day: rawDay && /^\d{4}-\d{2}-\d{2}$/.test(rawDay) ? rawDay : undefined,
         referrerHost: domain,
         uaClass: uaClass(agent),
         source: classifySource(get('cs-uri-query'), domain, referrer === host),
         device: classifyDevice(decodeLogField(agent ?? '')),
+        country: location?.country ?? 'ZZ',
+        ...(location ? { edge: location.edge } : {}),
       })
     } catch {
       // Any per-row error (bad %-encoding, etc.) → skip; never throw out.

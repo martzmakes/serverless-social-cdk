@@ -35,6 +35,7 @@ import {
   type EngagementTrendsInput,
 } from "./tools/engagement-trends";
 import { getPageViewsTool, type PageViewsInput } from "./tools/page-views";
+import { getSiteAnalyticsTool, type SiteOverviewInput } from "./tools/site-overview";
 import { createPostTool, type CreatePostInput } from "./tools/create-post";
 import {
   createLongformTool,
@@ -284,6 +285,24 @@ const TOOLS = [
     },
   },
   {
+    name: "get_site_analytics",
+    description:
+      "Site-wide analytics for one of the caller's approved accounts over the last 7, 30 or 90 " +
+      "days (default 30) compared with the previous window: human page views for articles, the " +
+      "home page and short-post pages, daily totals, top articles, top short posts with their " +
+      "Bluesky engagement change, traffic sources, devices, approximate reader countries and " +
+      "cities (from the serving CloudFront edge), top referrer domains, automated requests " +
+      "filtered out, and Bluesky follower change. Server-side logs only, no tracker.",
+    inputSchema: {
+      type: "object",
+      required: ["account"],
+      properties: {
+        account: { type: "string", description: "DID or handle from list_accounts" },
+        days: { type: "number", enum: [7, 30, 90], description: "Window in days (default 30)" },
+      },
+    },
+  },
+  {
     name: "whoami",
     description:
       "Returns the signed-in user's email + accounts they can post from (same as " +
@@ -399,6 +418,13 @@ async function callTool(
           email,
           args as unknown as PageViewsInput
         );
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(result) }],
+          structuredContent: result,
+        };
+      }
+      case "get_site_analytics": {
+        const result = await getSiteAnalyticsTool(email, args as unknown as SiteOverviewInput);
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
           structuredContent: result,

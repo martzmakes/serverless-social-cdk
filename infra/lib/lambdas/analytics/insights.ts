@@ -14,6 +14,7 @@ import { canonicalApOrigin, parseCustomHosts } from "../ap/host";
 import { applyReplyAction, blueskyLink, readHandled, readReplyAction, ReplyActionError } from "./reply-actions";
 import { articleFromIndexRow, type IndexItem } from "../pds/longform-index";
 import { trendDays, trendValues } from "./workspace-trends";
+import { buildSiteOverview, Tally } from "./site-overview";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const s3 = new S3Client({});
@@ -321,6 +322,7 @@ async function report(site: InsightSite, item: IndexItem, article: InsightArticl
   let views = 0;
   let classifiedViews = 0;
   const referrers = new Map<string, number>();
+  const geo = new Tally();
   const queryRange = (start: string, end: string, cursor?: Record<string, unknown>) => ddb.send(new QueryCommand({
     TableName: analyticsTable,
     KeyConditionExpression: "pk = :pk AND sk BETWEEN :start AND :end",
@@ -338,6 +340,7 @@ async function report(site: InsightSite, item: IndexItem, article: InsightArticl
       day.views = count(row.views);
       views += day.views;
       classifiedViews += count(row.classifiedViews);
+      geo.addRow(row);
       for (const key of Object.keys(SOURCES) as (keyof typeof SOURCES)[]) {
         const n = count(row[`source_${key}`]);
         if (n) sources[key] = (sources[key] ?? 0) + n;
@@ -366,6 +369,8 @@ async function report(site: InsightSite, item: IndexItem, article: InsightArticl
       .sort(([a, aCount], [b, bCount]) => bCount - aCount || a.localeCompare(b))
       .slice(0, 10)
       .map(([host, views]) => ({ host, views })),
+    countries: geo.countryList(),
+    cities: geo.cityList(8),
   };
 }
 
@@ -380,7 +385,8 @@ export async function handler(event: APIGatewayProxyEventV2) {
   if (method !== "GET" && !(method === "POST" && (sharingPath || articleAction))) {
     return json(405, { message: "Unsupported article action." });
   }
-  if (path !== base && !sharingPath && path !== `${base}/replies` && !path.startsWith(`${base}/articles`)) {
+  const overviewPath = path === `${base}/overview`;
+  if (path !== base && !sharingPath && !overviewPath && path !== `${base}/replies` && !path.startsWith(`${base}/articles`)) {
     return json(404, { message: "Analytics route unavailable." });
   }
   const host = workspaceHost(session, event.headers["x-pds-viewer-host"], sharing);
@@ -418,6 +424,11 @@ export async function handler(event: APIGatewayProxyEventV2) {
     if (!site) return json(403, { message: "This session cannot view analytics for the selected site." });
     if (!await canShare(sharing, site.host, host)) return json(403, { message: "The selected site’s content is unavailable in this workspace." });
     const pk = site.did === apexDid ? "IDX" : `IDX#${site.did}`;
+    if (overviewPath) {
+      const range = params.days ?? "30";
+      if (!["7", "30", "90"].includes(range)) return json(400, { message: "Select 7, 30, or 90 days." });
+      return json(200, await buildSiteOverview({ ddb, analyticsTable, indexTable, apexDid }, site, Number(range)));
+    }
     if (path === `${base}/articles` || path === `${base}/replies`) {
       if (params.after !== undefined && !recordKey.test(params.after)) return json(400, { message: "Invalid article cursor." });
       if (path === `${base}/replies`) return json(200, await replyQueue(site, pk, params.after));
