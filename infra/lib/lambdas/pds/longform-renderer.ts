@@ -206,12 +206,14 @@ export async function handler(event: { Records: any[] }): Promise<void> {
     await import('./longform-renderer-aws.js')
   const ports = makeAwsPorts()
   const store = makeRendererTenantStore()
+  const articleTimeZones = JSON.parse(process.env.ARTICLE_TIME_ZONES ?? "{}") as Record<string, string>
   for (const ev of eventsFromStream(event)) {
     // Apex events carry no `did` → targetForRepo resolves via the apex
     // short-circuit (no DDB read), s3Prefix:'' → byte-identical to before.
     const tgt = await targetForRepo(ev.did ?? '', store)
     const ctx = {
       origin: tgt.origin, siteName: tgt.siteName, author: tgt.author,
+      articleTimeZone: Object.hasOwn(articleTimeZones, tgt.author) ? articleTimeZones[tgt.author] : undefined,
       apCustomHosts: parseCustomHosts(process.env.AP_CUSTOM_HOSTS),
     }
     // tgt.s3Prefix === '' iff renderTargetForTenant resolved apex (apex
