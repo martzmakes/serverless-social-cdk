@@ -61,6 +61,8 @@ export interface ServerlessSocialStackProps extends cdk.StackProps {
   readonly hostedZoneId?: string;
   readonly alarmEmail?: string;
   readonly tenantHosts?: readonly string[];
+  /** IANA time zones for article dates, keyed by publishing hostname. Defaults to UTC. */
+  readonly articleTimeZones?: Readonly<Record<string, string>>;
   /** Relay hosts to notify after commits. Supply an empty array for isolated deployments. */
   readonly notifyOfUpdateTargets?: readonly string[];
   readonly firehose?: FirehoseConfiguration;
@@ -110,6 +112,11 @@ export class InfraStack extends cdk.Stack {
       ...(secondarySite ? [secondarySite.domain] : []),
     ])];
     [DOMAIN, ...tenantHosts].forEach(validateDomain);
+    const articleTimeZones = Object.entries(props.articleTimeZones ?? {});
+    for (const [host, timeZone] of articleTimeZones) {
+      validateDomain(host);
+      new Intl.DateTimeFormat("en-US", { timeZone });
+    }
     const pdsHandle = props.pdsHandle ?? DOMAIN;
     const firehose = props.firehose ?? { mode: "create" };
     if (firehose.mode === "existing") {
@@ -1293,6 +1300,9 @@ export class InfraStack extends cdk.Stack {
         // Task 15: the post page's author card shows the Mastodon handle at
         // the tenant's canonical AP host (same allowlist ApHandler uses).
         AP_CUSTOM_HOSTS: KNOWN_TENANT_HOSTS,
+        ...(articleTimeZones.length > 0
+          ? { ARTICLE_TIME_ZONES: JSON.stringify(Object.fromEntries(articleTimeZones)) }
+          : {}),
       },
       ...lambdaSource("pds/longform-renderer"),
     });

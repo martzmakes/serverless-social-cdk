@@ -48,6 +48,7 @@ export interface RenderCtx {
   origin: string
   siteName: string
   author: string
+  articleTimeZone?: string
   /**
    * Edge-rendered article CSS (martzmakes-layout-spec.md): the tenant's
    * resolved brand accent (from `social.serverless.config`), when the caller
@@ -484,18 +485,14 @@ const derived = (md: string, n: number): string =>
 /** "2026-05-01T12:00:00.000Z" → "May 1, 2026" (falls back to the raw ISO
  *  date slice if Intl/Date parsing throws — defensive, mirrors the rest of
  *  this file's crash-guarded formatting helpers). */
-function formatDisplayDate(iso: string): string {
+function formatDisplayDate(iso: string, articleTimeZone?: string): string {
   try {
     const d = new Date(iso)
     if (isNaN(d.getTime())) return iso.slice(0, 10)
-    // timeZone: 'UTC' pins the displayed calendar date to the ISO string's
-    // own UTC date regardless of the executing host's local timezone — a
-    // Lambda defaults to UTC, but `vitest` on a contributor's machine does
-    // not, and a naive `toLocaleDateString()` would render the day BEFORE
-    // the stored `createdAt` for any negative-UTC-offset host on the first
-    // few hours of a UTC day (caught by the apex byte-lock fixture, which
-    // uses `03:04:05Z`).
-    return d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' })
+    // Imported calendar dates can be stored as midnight UTC. Keep their day.
+    const isCalendarDate = /^\d{4}-\d{2}-\d{2}(?:T00:00:00(?:\.0+)?Z)?$/.test(iso)
+    const timeZone = isCalendarDate ? 'UTC' : articleTimeZone ?? 'UTC'
+    return d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric', timeZone })
   } catch {
     return iso.slice(0, 10)
   }
@@ -507,11 +504,11 @@ function formatDisplayDate(iso: string): string {
  * middot-separated, every field optional and gracefully omitted. Replaces
  * the previously separate `.meta` / `.tags` / `.origurl` blocks.
  */
-function buildMetaRow(rec: LongformContent, strippedContent: string, origin: string): string {
+function buildMetaRow(rec: LongformContent, strippedContent: string, { origin, articleTimeZone }: RenderCtx): string {
   const items: string[] = []
 
   items.push(
-    `<time datetime="${htmlEscape(rec.createdAt)}">${htmlEscape(formatDisplayDate(rec.createdAt))}</time>`,
+    `<time datetime="${htmlEscape(rec.createdAt)}">${htmlEscape(formatDisplayDate(rec.createdAt, articleTimeZone))}</time>`,
   )
   items.push(htmlEscape(readTimeLabel(strippedContent)))
 
@@ -974,7 +971,7 @@ ${name !== handle ? `<p class="author-handle">@${htmlEscape(handle)}</p>\n` : ''
   const rel = (ctx.related || []).slice(0, 3)
   const related = rel.length
     ? `\n<section class="related" aria-labelledby="related-h"><h2 id="related-h">Keep reading</h2><ul>${rel.map((r) =>
-        `<li><a href="${origin}/${encodeURIComponent(r.slug)}">${htmlEscape(r.title)}<time datetime="${htmlEscape(r.createdAt)}">${htmlEscape(formatDisplayDate(r.createdAt))}</time></a></li>`,
+        `<li><a href="${origin}/${encodeURIComponent(r.slug)}">${htmlEscape(r.title)}<time datetime="${htmlEscape(r.createdAt)}">${htmlEscape(formatDisplayDate(r.createdAt, ctx.articleTimeZone))}</time></a></li>`,
       ).join('')}</ul></section>`
     : ''
   return `${card}${related}`
@@ -1007,7 +1004,7 @@ export function renderArticleHtml(rec: LongformContent, ctx: RenderCtx): string 
   const safeOrigin = htmlEscape(ctx.origin)
   const safeUrl = htmlEscape(url)
   const profileHref = `${safeOrigin}/profile/${encodeURIComponent(ctx.author)}`
-  const metaRowHtml = buildMetaRow(rec, strippedContent, ctx.origin)
+  const metaRowHtml = buildMetaRow(rec, strippedContent, ctx)
   const endMatter = renderEndMatter(rec, ctx)
   const videoHtml = renderVideoCompanion(rec.video)
   const jsonLd = JSON.stringify({
