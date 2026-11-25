@@ -6,7 +6,7 @@ import { buildBlueskySyndication } from './longform-syndication'
 import { safeSlug } from './longform-routing'
 import { APEX_DID } from './tenant-keys'
 import { parseCustomHosts } from '../ap/host'
-import type { CoverPreview } from './longform-preview'
+import type { ArticleShareImage, CoverPreview } from './longform-preview'
 
 /** Per-event tenant identity threaded into every tenant-sensitive Ports call.
  *  - apex (isApex:true, did:APEX_DID, s3Prefix:''): the Ports adapter MUST use
@@ -207,6 +207,7 @@ export async function handler(event: { Records: any[] }): Promise<void> {
   const ports = makeAwsPorts()
   const store = makeRendererTenantStore()
   const articleTimeZones = JSON.parse(process.env.ARTICLE_TIME_ZONES ?? "{}") as Record<string, string>
+  const articleShareImages = JSON.parse(process.env.ARTICLE_SHARE_IMAGES ?? "{}") as Record<string, ArticleShareImage>
   for (const ev of eventsFromStream(event)) {
     // Apex events carry no `did` → targetForRepo resolves via the apex
     // short-circuit (no DDB read), s3Prefix:'' → byte-identical to before.
@@ -214,6 +215,7 @@ export async function handler(event: { Records: any[] }): Promise<void> {
     const ctx = {
       origin: tgt.origin, siteName: tgt.siteName, author: tgt.author,
       articleTimeZone: Object.hasOwn(articleTimeZones, tgt.author) ? articleTimeZones[tgt.author] : undefined,
+      articleShareImage: Object.hasOwn(articleShareImages, tgt.author) ? articleShareImages[tgt.author] : undefined,
       apCustomHosts: parseCustomHosts(process.env.AP_CUSTOM_HOSTS),
     }
     // tgt.s3Prefix === '' iff renderTargetForTenant resolved apex (apex

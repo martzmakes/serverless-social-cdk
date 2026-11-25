@@ -11,7 +11,7 @@ import css from 'highlight.js/lib/languages/css'
 import sql from 'highlight.js/lib/languages/sql'
 import { sanitizeWithProfile, attr, type SanitizeProfile } from '../ap/sanitize'
 import { canonicalApHost } from '../ap/host'
-import { absoluteImageUrl, shareImageTags, type CoverPreview } from './longform-preview'
+import { absoluteImageUrl, shareImageTags, type ArticleShareImage, type CoverPreview } from './longform-preview'
 import { normalizeVideoCompanion, type VideoCompanion } from '../../../youtube'
 
 export interface LongformContent {
@@ -49,6 +49,7 @@ export interface RenderCtx {
   siteName: string
   author: string
   articleTimeZone?: string
+  articleShareImage?: ArticleShareImage
   /**
    * Edge-rendered article CSS (martzmakes-layout-spec.md): the tenant's
    * resolved brand accent (from `social.serverless.config`), when the caller
@@ -991,11 +992,11 @@ export function coverAltText(value: unknown, markdown: string, cover: string, or
 export function renderArticleHtml(rec: LongformContent, ctx: RenderCtx): string {
   const url = `${ctx.origin}/${rec.slug}`
   const cover = absoluteImageUrl(rec.coverImage, ctx.origin)
-  const preview = cover ? ctx.coverPreview : undefined
+  const preview = cover ? ctx.coverPreview : ctx.articleShareImage
   const strippedContent = stripFrontmatter(rec.content, rec.title)
-  const alt = cover ? coverAltText(rec.coverImageAlt, strippedContent, cover, ctx.origin) : undefined
+  const alt = cover ? coverAltText(rec.coverImageAlt, strippedContent, cover, ctx.origin) : ctx.articleShareImage?.alt
   const img = preview?.url ?? cover ?? `${ctx.origin}/og-default.png`
-  const imageTags = shareImageTags({ url: img, preview, alt: cover ? alt : undefined, isCover: !!cover })
+  const imageTags = shareImageTags({ url: img, preview, alt, isCover: !!cover })
   const desc = (rec.excerpt && rec.excerpt.trim()) || derived(strippedContent, 160)
   const title = `${rec.title} — ${ctx.siteName}`
   const siteName = htmlEscape(ctx.siteName)
