@@ -36,6 +36,7 @@ import { LongformIndexTable } from "./longform-index-table";
 import { PostAnalyticsTable } from "./post-analytics-table";
 import { TenantsTable } from "./tenants-table";
 import { PostEditor } from "./post-editor";
+import type { ArticleShareImage } from "./lambdas/pds/longform-preview";
 
 export type FirehoseConfiguration =
   | {
@@ -63,6 +64,8 @@ export interface ServerlessSocialStackProps extends cdk.StackProps {
   readonly tenantHosts?: readonly string[];
   /** IANA time zones for article dates, keyed by publishing hostname. Defaults to UTC. */
   readonly articleTimeZones?: Readonly<Record<string, string>>;
+  /** Default Open Graph image for articles without a cover, keyed by publishing hostname. */
+  readonly articleShareImages?: Readonly<Record<string, ArticleShareImage>>;
   /** Relay hosts to notify after commits. Supply an empty array for isolated deployments. */
   readonly notifyOfUpdateTargets?: readonly string[];
   readonly firehose?: FirehoseConfiguration;
@@ -116,6 +119,17 @@ export class InfraStack extends cdk.Stack {
     for (const [host, timeZone] of articleTimeZones) {
       validateDomain(host);
       new Intl.DateTimeFormat("en-US", { timeZone });
+    }
+    const articleShareImages = Object.entries(props.articleShareImages ?? {});
+    for (const [host, image] of articleShareImages) {
+      validateDomain(host);
+      const url = new URL(image.url);
+      if (url.protocol !== "https:" || url.username || url.password ||
+          !Number.isInteger(image.width) || image.width <= 0 ||
+          !Number.isInteger(image.height) || image.height <= 0 ||
+          !["image/jpeg", "image/png"].includes(image.mimeType) || !image.alt.trim()) {
+        throw new Error(`Expected an HTTPS JPEG or PNG share image with dimensions and alt text for ${host}`);
+      }
     }
     const pdsHandle = props.pdsHandle ?? DOMAIN;
     const firehose = props.firehose ?? { mode: "create" };
@@ -1302,6 +1316,9 @@ export class InfraStack extends cdk.Stack {
         AP_CUSTOM_HOSTS: KNOWN_TENANT_HOSTS,
         ...(articleTimeZones.length > 0
           ? { ARTICLE_TIME_ZONES: JSON.stringify(Object.fromEntries(articleTimeZones)) }
+          : {}),
+        ...(articleShareImages.length > 0
+          ? { ARTICLE_SHARE_IMAGES: JSON.stringify(Object.fromEntries(articleShareImages)) }
           : {}),
       },
       ...lambdaSource("pds/longform-renderer"),

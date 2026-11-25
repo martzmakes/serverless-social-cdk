@@ -51,6 +51,24 @@ describe('article share images', () => {
     expect(patchArticleShareMetadata(original, origin + '/different.jpg', tags)).toEqual(original)
   })
 
+  it('advertises the configured fallback and dimensions when the article has no cover', () => {
+    const defaultImage = {
+      url: `${origin}/assets/og/writer-v1.jpg`, width: 1200, height: 630, mimeType: 'image/jpeg',
+      alt: 'Writer’s blog',
+    }
+    const ctx = { ...site, articleShareImage: defaultImage }
+    const html = renderArticleHtml({ ...article, coverImage: undefined }, ctx)
+    expect(html).toContain(`<meta property="og:image" content="${defaultImage.url}">`)
+    expect(html).toContain(`<meta property="og:image:secure_url" content="${defaultImage.url}">`)
+    expect(html).toContain('<meta property="og:image:type" content="image/jpeg">')
+    expect(html).toContain('<meta property="og:image:width" content="1200">')
+    expect(html).toContain('<meta property="og:image:height" content="630">')
+    expect(html).toContain('<meta property="og:image:alt" content="Writer’s blog">')
+    expect(html).toContain(`<meta name="twitter:image" content="${defaultImage.url}">`)
+    expect(html).toContain('<meta name="twitter:image:alt" content="Writer’s blog">')
+    expect(renderArticleHtml(article, { ...ctx, coverPreview: preview })).not.toContain(defaultImage.url)
+  })
+
   it('uses an absolute original when no thumbnail is available and the default for unsafe URLs', () => {
     const html = renderArticleHtml({ ...article, coverImageAlt: 'A "paper" sketch' }, site)
     expect(html).toContain(`<meta property="og:image" content="${origin}${blob.replace('&', '&amp;')}">`)

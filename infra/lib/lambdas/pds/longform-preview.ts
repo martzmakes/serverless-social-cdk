@@ -5,6 +5,8 @@ export interface CoverPreview {
   mimeType: string
 }
 
+export type ArticleShareImage = CoverPreview & { alt: string }
+
 export function absoluteImageUrl(value: unknown, origin: string): string | undefined {
   if (typeof value !== 'string' || !value.trim()) return
   try {
@@ -23,7 +25,7 @@ export function shareImageTags(image: { url: string; preview?: CoverPreview; alt
   const url = attr(image.url)
   const openGraph = [`<meta property="og:image" content="${url}">`]
   const twitter = [`<meta name="twitter:image" content="${url}">`]
-  if (image.isCover && image.url.startsWith('https:')) {
+  if ((image.isCover || image.preview) && image.url.startsWith('https:')) {
     openGraph.push(`<meta property="og:image:secure_url" content="${url}">`)
   }
   if (image.preview) {
