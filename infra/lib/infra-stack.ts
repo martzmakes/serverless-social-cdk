@@ -36,6 +36,7 @@ import { LongformIndexTable } from "./longform-index-table";
 import { PostAnalyticsTable } from "./post-analytics-table";
 import { TenantsTable } from "./tenants-table";
 import { PostEditor } from "./post-editor";
+import type { ArticleShareImage } from "./lambdas/pds/longform-preview";
 
 export type FirehoseConfiguration =
   | {
@@ -50,8 +51,6 @@ export type FirehoseConfiguration =
       readonly instanceId: string;
       readonly ipAddressType?: cloudfront.OriginIpAddressType;
     };
-
-import type { ArticleShareImage } from "./lambdas/pds/longform-preview";
 
 export interface ServerlessSocialStackProps extends cdk.StackProps {
   readonly domain: string;
